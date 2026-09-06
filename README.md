@@ -80,6 +80,45 @@ factor:
   url: http://127.0.0.1:50053/mcp
 ```
 
+## Docker 部署
+
+无需本地 Python 环境，一条命令起服务：
+
+```bash
+docker compose up -d        # 构建镜像 + 启动容器（首次构建约 3-5 分钟）
+docker compose ps           # 查看状态
+docker compose logs -f      # 跟踪日志
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:50053/health
+curl http://127.0.0.1:50053/tools   # 应返回 15 个工具
+```
+
+说明与限制：
+
+- 镜像不含 `pyqlib`（PyPI 无 linux/aarch64 wheel，arm64 需源码编译），
+  因此 `factor_backtest` / `gen_data` / `update_data` 等回测/数据工具
+  在容器内不可用；纯 pandas 工具（`compute_factors` / `predict` /
+  `factor_recent_ic` 等）开箱即用。h5 数据集可通过 volume 挂载：
+  `- ./data:/app/data` 并设 `FACTOR_MINER_DATA_DIR=/app/data/factor_mining`。
+- `lightgbm` 已随镜像安装（linux wheel 自带 OpenMP 运行时），
+  `ml_train_rolling` / `ml_predict` 可用。
+- Redis 缓存（`dfactor:*` 写入）可选：设置 `REDIS_URL` 指向可达的
+  Redis，缺失时自动降级跳过缓存写入。
+
+license 鉴权（可选）：在 `docker-compose.yml` 中取消注释，把宿主机
+`licenses.json` 挂进容器并设置 `MCP_LICENSE_FILE`：
+
+```yaml
+environment:
+  MCP_LICENSE_FILE: /app/licenses/licenses.json
+volumes:
+  - ./licenses.json:/app/licenses/licenses.json:ro
+```
+
 ## 数据准备（回测类工具需要）
 
 `factor_execute` / `factor_backtest` / `factor_oos_check` 依赖 qlib
