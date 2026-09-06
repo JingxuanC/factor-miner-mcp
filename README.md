@@ -1,0 +1,98 @@
+# Factor Miner MCP
+
+A 股量化因子挖掘工具集的独立 MCP（Model Context Protocol）服务。从
+[Athena](https://github.com/JingxuanC/Athena) 的 py-sidecar 中抽取
+factor 域，让任何 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研
+Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上线巡检」流水线。
+
+## 工具清单（7 个）
+
+| 工具 | 说明 | 负载 |
+|------|------|------|
+| `factor_execute` | 沙箱执行 factor.py（import 白名单 + rlimit + 120s 超时），跑评估电池 | 重（异步） |
+| `factor_backtest` | 全量 qlib 回测：SOTA 因子 + 新因子对齐 Alpha20 baseline，qrun 出指标 | 重（异步） |
+| `factor_oos_check` | 生产准入 OOS 检查：挖掘窗口 vs 纯样本外窗口，报告 IC/年化/回撤 + 衰减 | 重（异步） |
+| `factor_daily_compute` | 每日收盘后计算在线因子，写 Redis `dfactor:{symbol}`（TTL 48h） | 重（异步） |
+| `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 轻 |
+| `compute_factors` | 从 OHLCV K线计算 Alpha158 风格因子（纯 pandas） | 轻 |
+| `predict` | 因子值 → ML 信号预测 | 轻 |
+
+重负载工具提交即入队返回 `job_id`，轮询 `GET /jobs/<id>` 拿结果，
+不占 HTTP 连接。
+
+## 快速开始
+
+```bash
+pip install -r requirements.txt
+python3 server.py --port 50053
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:50053/health
+curl http://127.0.0.1:50053/tools
+```
+
+接入 MCP 客户端（以 Claude Desktop / Kimi Code 为例）：
+
+```yaml
+# mcp 配置
+factor:
+  url: http://127.0.0.1:50053/mcp
+```
+
+## 数据准备（回测类工具需要）
+
+`factor_execute` / `factor_backtest` / `factor_oos_check` 依赖 qlib
+cn_data 导出的日频量价 h5 数据集：
+
+```bash
+pip install pyqlib  # arm64 Linux 需从 GitHub 源码编译，见 requirements.txt 注释
+python3 -m factor_miner.update_data          # qlib cn_data 增量更新
+python3 -m factor_miner.gen_data --debug     # 调试集（100 股 × 2 年）
+python3 -m factor_miner.gen_data --full      # 全量（回测用）
+```
+
+`factor_recent_ic` / `compute_factors` / `predict` 纯 pandas 实现，
+不依赖 qlib，开箱即用。
+
+## 鉴权与额度（可选）
+
+默认开放模式（本地/内网）。设置环境变量后强制 license key 鉴权：
+
+```bash
+export MCP_LICENSE_FILE=/path/to/licenses.json
+python3 server.py --port 50053
+# 客户端请求头：X-License-Key: <key>
+```
+
+license JSON 格式与额度语义见 `mcp_gateway.py`  docstring。`GET /quota`
+查余量，`GET /queue-stats` 看队列。
+
+## 端点一览
+
+```
+GET  /health        健康检查
+GET  /tools         工具 JSON schema 列表
+POST /mcp           MCP JSON-RPC（initialize / tools/list / tools/call）
+GET  /jobs/<id>     异步任务状态/结果
+GET  /quota         license 额度余量（鉴权模式）
+GET  /queue-stats   队列概况
+```
+
+## 沙箱安全模型
+
+`factor_execute` 等执行用户提交的 factor.py 时在子进程沙箱中运行：
+AST import 白名单（仅 pandas/numpy 等）、rlimit 资源限制、120s 超时、
+隔离工作目录。实现见 `factor_miner/sandbox.py`。
+
+## 致谢
+
+- `factor_miner/gen_data.py` 移植自 microsoft/RD-Agent（MIT）
+- `factor_miner/qlib_dump_bin.py` 裁剪自 microsoft/qlib v0.9.6（MIT）
+- 本项目主体来自 [Athena](https://github.com/JingxuanC/Athena)
+
+## License
+
+MIT

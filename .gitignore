@@ -1,0 +1,17 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# 数据与运行产物
+*.h5
+.data_cache/
+data/
+runs/
+*.log
+
+# 环境
+.env
+.venv/
+venv/

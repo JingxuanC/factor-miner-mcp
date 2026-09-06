@@ -1,0 +1,10 @@
+numpy>=1.26,<2
+pandas>=2.0
+scipy>=1.10
+# h5 数据集读写（daily_pv.h5 / result.h5）
+pyarrow>=14.0
+tables>=3.9
+# factor_daily_compute 写 dfactor:{symbol}（可选，无 redis 时降级跳过缓存写入）
+redis>=5.0
+# ── 可选：qlib 回测/数据导出（factor_backtest / gen_data / update_data）──
+# pyqlib>=0.9.6   # PyPI 无 linux/aarch64 wheel；arm64 需从 GitHub 源码编译
