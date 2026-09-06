@@ -5,7 +5,9 @@ A 股量化因子挖掘工具集的独立 MCP（Model Context Protocol）服务�
 factor 域，让任何 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研
 Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上线巡检」流水线。
 
-## 工具清单（10 个）
+## 工具清单（15 个）
+
+**因子挖掘**
 
 | 工具 | 说明 | 负载 |
 |------|------|------|
@@ -16,12 +18,45 @@ Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上
 | `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 轻 |
 | `compute_factors` | 从 OHLCV K线计算 Alpha158 风格因子（纯 pandas） | 轻 |
 | `predict` | 因子值 → ML 信号预测 | 轻 |
+
+**ML**
+
+| 工具 | 说明 | 负载 |
+|------|------|------|
 | `ml_train_rolling` | 滚动 LGBM 训练：K线 → Alpha158 因子 + 次日收益标签 → 扩张窗训练，输出 IC/RankIC/Sharpe | 重（异步） |
 | `ml_predict` | 用滚动模型出次日收益预测（优先 Redis 因子快照，回退实时计算） | 轻 |
 | `ml_metrics` | 训练器状态：最近训练日、逐日指标、模型是否存在、特征清单 | 轻 |
 
+**因子评估与组合**
+
+| 工具 | 说明 | 负载 |
+|------|------|------|
+| `factor_tearsheet` | Alphalens 式因子完整评估：分位数组收益、多空价差、IC 序列（均值/IR/衰减）、换手率（手写 pandas） | 轻 |
+| `portfolio_optimize` | 组合优化：HRP / 等权 / 最小方差内置；装 pypfopt 后支持 `mean_variance`（max Sharpe） | 轻 |
+| `regime_detect` | 牛/熊/震荡识别：规则状态机（动量 + 已实现波动率阈值）内置；装 hmmlearn 走 GaussianHMM | 轻 |
+| `change_point` | 结构突变检测：CUSUM + 二分分割（水平 + 漂移两路）内置；装 ruptures 走 PELT | 轻 |
+| `vol_forecast` | 波动率预测：EWMA（λ=0.94）+ Parkinson 高低价参考内置；装 arch 走 GARCH(1,1) | 轻 |
+
 重负载工具提交即入队返回 `job_id`，轮询 `GET /jobs/<id>` 拿结果，
 不占 HTTP 连接。
+
+### 实现说明与算法出处
+
+- `factor_tearsheet` **手写 pandas 而非依赖 alphalens 本体**：alphalens
+  已半停维护（上游多年无实质更新），其依赖链与 pandas>=2 冲突频发；
+  分位数收益 / IC / 换手率逻辑本身很短，手写可控、可测、零额外依赖。
+- HRP — López de Prado (2016), *Building Diversified Portfolios that
+  Outperform Out-of-Sample*（相关距离 → 层次聚类 → 拟对角化 → 递归二分）。
+- EWMA — RiskMetrics (1996), J.P. Morgan Technical Document，λ=0.94，
+  多期预测平坦外推。
+- PELT — Killick et al. (2012), *Optimal Detection of Changepoints With
+  a Linear Computational Cost*, JASA（可选增强，内置为 CUSUM（Page 1954）
+  + 二分分割）。
+- HMM — GaussianHMM（收益率 + 滚动波动率两特征，可选增强，内置为规则
+  状态机）。
+- 全部 5 个工具：**纯 numpy/pandas/scipy 路径开箱可用**，重库
+  （pypfopt / hmmlearn / ruptures / arch）惰性导入做可选增强，输出
+  `method` 字段标注实际实现。
 
 ## 快速开始
 

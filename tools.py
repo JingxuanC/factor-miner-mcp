@@ -161,6 +161,79 @@ def ml_metrics() -> str:
     from trainer import get_trainer
     return json.dumps(get_trainer().get_metrics())
 
+# ═══════════════════════════════════════════════════════════════
+# 因子评估与组合分析五件套（analytics.py）
+# 纯 numpy/pandas/scipy 内置实现开箱可用；pypfopt/hmmlearn/ruptures/arch
+# 惰性导入做可选增强，输出 method 字段标注实际实现。全部轻负载同步。
+# ═══════════════════════════════════════════════════════════════
+
+@tool("factor_tearsheet", "Alphalens-style factor evaluation (hand-written pandas, no alphalens "
+      "dependency): quantile returns per forward period, long-short spread, daily cross-sectional "
+      "Spearman IC (mean/IR/decay), top/bottom bucket turnover. "
+      "Returns JSON string: {quantile_returns, long_short, ic: {mean, ir, series_summary, decay}, turnover, method}.",
+      {"factor_values": {"type": "array", "description": "[{date, symbol, value}, ...]"},
+       "klines": {"type": "object", "description": "{symbol: [{date, close}, ...]}"},
+       "quantiles": {"type": "integer", "description": "Number of quantile buckets (default 5)", "default": 5},
+       "periods": {"type": "array", "description": "Forward return periods in days (default [1,5,10])", "default": [1, 5, 10]}},
+      required=["factor_values", "klines"])
+def factor_tearsheet(factor_values: list, klines: dict, quantiles: int = 5,
+                     periods: Optional[list] = None) -> str:
+    import analytics
+    return analytics.factor_tearsheet(factor_values, klines, quantiles, periods)
+
+
+@tool("portfolio_optimize", "Portfolio optimization: hrp (hierarchical risk parity, "
+      "López de Prado 2016) / equal / min_variance (numpy analytic, long-only) built in; "
+      "mean_variance via pypfopt when installed (lazy import). "
+      "Returns JSON string: {weights, expected_return, volatility, sharpe, method}.",
+      {"symbols": {"type": "array", "description": "Symbols to allocate"},
+       "klines": {"type": "object", "description": "{symbol: [{date, close}, ...]}"},
+       "method": {"type": "string", "enum": ["hrp", "equal", "min_variance", "mean_variance"], "default": "hrp"},
+       "lookback": {"type": "integer", "description": "Estimation window in days (default 120)", "default": 120}},
+      required=["symbols", "klines"])
+def portfolio_optimize(symbols: list, klines: dict, method: str = "hrp",
+                       lookback: int = 120) -> str:
+    import analytics
+    return analytics.portfolio_optimize(symbols, klines, method, lookback)
+
+
+@tool("regime_detect", "Market regime detection (bull/bear/range): built-in rule engine "
+      "(20d momentum + realized vol thresholds); GaussianHMM (ret+vol features) via hmmlearn "
+      "when installed (lazy import). Returns JSON string: "
+      "{current_regime, regime_history, regime_stats, method}.",
+      {"klines": {"type": "array", "description": "[{date, close, volume?}, ...] (index or single stock)"},
+       "n_regimes": {"type": "integer", "description": "2 (bull/bear) or 3 (+range), default 3", "default": 3}},
+      required=["klines"])
+def regime_detect(klines: list, n_regimes: int = 3) -> str:
+    import analytics
+    return analytics.regime_detect(klines, n_regimes)
+
+
+@tool("change_point", "Structural change-point detection: built-in CUSUM (Page 1954) + binary "
+      "segmentation on mean shifts; PELT (Killick 2012) via ruptures when installed (lazy import). "
+      "Returns JSON string: {change_points: [{date, index, significance}], method}.",
+      {"series": {"type": "array", "description": "[{date, value}, ...]"},
+       "method": {"type": "string", "enum": ["auto", "cusum_binseg", "pelt"], "default": "auto"},
+       "max_bkps": {"type": "integer", "description": "Max breakpoints (default 5)", "default": 5}},
+      required=["series"])
+def change_point(series: list, method: str = "auto", max_bkps: int = 5) -> str:
+    import analytics
+    return analytics.change_point(series, method, max_bkps)
+
+
+@tool("vol_forecast", "Volatility forecast: built-in EWMA (RiskMetrics 1996, lambda=0.94, flat "
+      "multi-day extrapolation) + Parkinson high/low reference when OHLC given; GARCH(1,1) via "
+      "arch when installed (lazy import). Returns JSON string: "
+      "{forecast: [{day, vol}], current_vol, method} (daily vol as decimal).",
+      {"klines": {"type": "array", "description": "[{date, close, high?, low?}, ...]"},
+       "horizon": {"type": "integer", "description": "Forecast days ahead (default 5)", "default": 5},
+       "method": {"type": "string", "enum": ["auto", "ewma", "garch"], "default": "auto"}},
+      required=["klines"])
+def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
+    import analytics
+    return analytics.vol_forecast(klines, horizon, method)
+
+
 # compute_factors / predict 无 @tool schema，由 server 端硬编码补（见 server.py）
 EXTRA_SCHEMAS = {
     "compute_factors": {"name": "compute_factors", "description": "Compute Alpha158 factors from OHLCV data",
