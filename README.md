@@ -5,7 +5,7 @@ A 股量化因子挖掘工具集的独立 MCP（Model Context Protocol）服务�
 factor 域，让任何 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研
 Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上线巡检」流水线。
 
-## 工具清单（7 个）
+## 工具清单（10 个）
 
 | 工具 | 说明 | 负载 |
 |------|------|------|
@@ -16,6 +16,9 @@ Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上
 | `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 轻 |
 | `compute_factors` | 从 OHLCV K线计算 Alpha158 风格因子（纯 pandas） | 轻 |
 | `predict` | 因子值 → ML 信号预测 | 轻 |
+| `ml_train_rolling` | 滚动 LGBM 训练：K线 → Alpha158 因子 + 次日收益标签 → 扩张窗训练，输出 IC/RankIC/Sharpe | 重（异步） |
+| `ml_predict` | 用滚动模型出次日收益预测（优先 Redis 因子快照，回退实时计算） | 轻 |
+| `ml_metrics` | 训练器状态：最近训练日、逐日指标、模型是否存在、特征清单 | 轻 |
 
 重负载工具提交即入队返回 `job_id`，轮询 `GET /jobs/<id>` 拿结果，
 不占 HTTP 连接。

@@ -125,6 +125,42 @@ def _predict_handler(symbol: str = "", factors: dict = None) -> str:
 HANDLERS.setdefault("compute_factors", _compute_factors_handler)
 HANDLERS.setdefault("predict", _predict_handler)
 
+
+# ═══════════════════════════════════════════════════════════════
+# ML 滚动训练（RollingTrainer：Alpha158 因子 + 次日收益标签 → LGBM）
+# lightgbm 缺失时 trainer 内部优雅降级（status=error），服务照常启动。
+# ═══════════════════════════════════════════════════════════════
+
+@tool("ml_train_rolling", "Rolling LGBM training on expanding window: computes Alpha158-style "
+      "factors + next-day-return labels from raw OHLCV klines, trains LGBMRegressor, "
+      "evaluates IC/rank_ic/sharpe on the validation tail, saves model to disk. "
+      "Returns JSON string: {status, ic, rank_ic, sharpe, n_samples, n_features, model_path}.",
+      {"klines_list": {"type": "array", "description": "[{symbol, klines: [{date,open,high,low,close,volume}, ...]}, ...] (>=30 klines per symbol)"},
+       "validation_days": {"type": "integer", "description": "Tail samples for validation (default 20)", "default": 20},
+       "early_stopping_rounds": {"type": "integer", "description": "LGBM patience (default 20)", "default": 20}},
+      required=["klines_list"])
+def ml_train_rolling(klines_list: list, validation_days: int = 20, early_stopping_rounds: int = 20) -> str:
+    from trainer import get_trainer
+    return json.dumps(get_trainer().train(klines_list, validation_days, early_stopping_rounds))
+
+
+@tool("ml_predict", "Next-day return predictions from the trained rolling model. "
+      "Prefers Redis factor:{symbol} snapshots, falls back to on-the-fly factor compute. "
+      "Returns JSON string: {status, n_predicted, predictions: {symbol: score}}.",
+      {"klines_list": {"type": "array", "description": "[{symbol, klines: [...]}, ...] (klines used when no Redis snapshot)"}},
+      required=["klines_list"])
+def ml_predict(klines_list: list) -> str:
+    from trainer import get_trainer
+    return json.dumps(get_trainer().predict(klines_list))
+
+
+@tool("ml_metrics", "Rolling trainer status: last training date, per-day metrics "
+      "(ic/rank_ic/sharpe/top10_return), model existence, feature names.",
+      {})
+def ml_metrics() -> str:
+    from trainer import get_trainer
+    return json.dumps(get_trainer().get_metrics())
+
 # compute_factors / predict 无 @tool schema，由 server 端硬编码补（见 server.py）
 EXTRA_SCHEMAS = {
     "compute_factors": {"name": "compute_factors", "description": "Compute Alpha158 factors from OHLCV data",

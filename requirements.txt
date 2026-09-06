@@ -6,5 +6,8 @@ pyarrow>=14.0
 tables>=3.9
 # factor_daily_compute 写 dfactor:{symbol}（可选，无 redis 时降级跳过缓存写入）
 redis>=5.0
+# ML 滚动训练（ml_train_rolling/ml_predict/ml_metrics）；缺失时服务照常
+# 启动，训练工具返回明确错误。macOS 需先 brew install libomp
+lightgbm>=4.3
 # ── 可选：qlib 回测/数据导出（factor_backtest / gen_data / update_data）──
 # pyqlib>=0.9.6   # PyPI 无 linux/aarch64 wheel；arm64 需从 GitHub 源码编译
