@@ -174,6 +174,93 @@ class LicenseStore:
             logger.warn("usage save failed: %s", e)
 
 
+# ═══════════════ Prometheus 指标 ═══════════════
+
+class Metrics:
+    """进程内 Prometheus 指标（纯标准库，线程安全）。
+
+    延迟只记 sum/count 两个 counter（够算平均值），不引入 histogram 桶；
+    /metrics 端点直接调 render() 输出 text exposition 格式。
+    """
+
+    def __init__(self):
+        self._start = time.time()
+        self._mu = threading.Lock()
+        self._calls: dict[tuple[str, str], int] = {}   # (tool, status) → count
+        self._lat_sum: dict[str, float] = {}           # tool → 累计秒数
+        self._lat_count: dict[str, int] = {}           # tool → 计时次数
+        self._license_checks: dict[str, int] = {}      # result → count
+
+    def inc_call(self, tool: str, status: str):
+        """status ∈ ok/error/rejected_license/rejected_quota/queued"""
+        with self._mu:
+            k = (tool, status)
+            self._calls[k] = self._calls.get(k, 0) + 1
+
+    def observe_latency(self, tool: str, seconds: float):
+        with self._mu:
+            self._lat_sum[tool] = self._lat_sum.get(tool, 0.0) + seconds
+            self._lat_count[tool] = self._lat_count.get(tool, 0) + 1
+
+    def inc_license_check(self, result: str):
+        """result ∈ ok/invalid"""
+        with self._mu:
+            self._license_checks[result] = self._license_checks.get(result, 0) + 1
+
+    def render(self, queue: "JobQueue | None" = None) -> str:
+        """Prometheus text exposition 格式；传入 JobQueue 时追加队列指标。"""
+        with self._mu:
+            calls = sorted(self._calls.items())
+            lat_sum = dict(self._lat_sum)
+            lat_count = dict(self._lat_count)
+            lic = sorted(self._license_checks.items())
+        lines = [
+            "# HELP mcp_tool_calls_total Total MCP tool calls by tool and status.",
+            "# TYPE mcp_tool_calls_total counter",
+        ]
+        for (tool, status), n in calls:
+            lines.append(f'mcp_tool_calls_total{{tool="{tool}",status="{status}"}} {n}')
+        lines += [
+            "# HELP mcp_tool_latency_seconds_sum Total seconds spent executing tools.",
+            "# TYPE mcp_tool_latency_seconds_sum counter",
+        ]
+        for tool in sorted(lat_sum):
+            lines.append(f'mcp_tool_latency_seconds_sum{{tool="{tool}"}} {lat_sum[tool]:.6f}')
+        lines += [
+            "# HELP mcp_tool_latency_seconds_count Number of timed tool executions.",
+            "# TYPE mcp_tool_latency_seconds_count counter",
+        ]
+        for tool in sorted(lat_count):
+            lines.append(f'mcp_tool_latency_seconds_count{{tool="{tool}"}} {lat_count[tool]}')
+        lines += [
+            "# HELP mcp_license_check_total License key checks by result.",
+            "# TYPE mcp_license_check_total counter",
+        ]
+        for result, n in lic:
+            lines.append(f'mcp_license_check_total{{result="{result}"}} {n}')
+        lines += [
+            "# HELP mcp_uptime_seconds Process uptime in seconds.",
+            "# TYPE mcp_uptime_seconds gauge",
+            f"mcp_uptime_seconds {time.time() - self._start:.1f}",
+        ]
+        if queue is not None:
+            st = queue.stats()
+            lines += [
+                "# HELP mcp_queue_depth Current number of jobs waiting in queue.",
+                "# TYPE mcp_queue_depth gauge",
+                f"mcp_queue_depth {st['queue_size']}",
+                "# HELP mcp_queue_jobs_total Async jobs finished by status.",
+                "# TYPE mcp_queue_jobs_total counter",
+            ]
+            for status in ("done", "error"):
+                n = st.get("jobs_total", {}).get(status, 0)
+                lines.append(f'mcp_queue_jobs_total{{status="{status}"}} {n}')
+        return "\n".join(lines) + "\n"
+
+
+METRICS = Metrics()
+
+
 # ═══════════════ 异步任务队列 ═══════════════
 
 class QueueFull(Exception):
@@ -193,6 +280,7 @@ class JobQueue:
         self._handlers = handlers
         self._q: queue.Queue[str] = queue.Queue(maxsize=maxsize)
         self._jobs: dict[str, dict] = {}
+        self._jobs_total = {"done": 0, "error": 0}  # 累计完成数（给 /metrics）
         self._ttl = ttl_sec
         self._mu = threading.Lock()
         self._stop = threading.Event()
@@ -243,7 +331,7 @@ class JobQueue:
             for j in self._jobs.values():
                 by_status[j["status"]] = by_status.get(j["status"], 0) + 1
         return {"workers": len(self._threads), "queue_size": self._q.qsize(),
-                "jobs": by_status}
+                "jobs": by_status, "jobs_total": dict(self._jobs_total)}
 
     def _worker(self):
         while not self._stop.is_set():
@@ -255,16 +343,23 @@ class JobQueue:
                 if job_id not in self._jobs:
                     continue
                 self._jobs[job_id]["status"] = "running"
+                created_at = self._jobs[job_id]["created_at"]
             try:
                 result = self._handlers[tool](**args)
                 with self._mu:
                     self._jobs[job_id].update(status="done", result=str(result),
                                               finished_at=time.time())
+                    self._jobs_total["done"] += 1
+                METRICS.inc_call(tool, "ok")
+                METRICS.observe_latency(tool, time.time() - created_at)
             except Exception as e:  # noqa: BLE001
                 logger.error("job %s (%s) failed: %s", job_id, tool, e)
                 with self._mu:
                     self._jobs[job_id].update(status="error", error=str(e),
                                               finished_at=time.time())
+                    self._jobs_total["error"] += 1
+                METRICS.inc_call(tool, "error")
+                METRICS.observe_latency(tool, time.time() - created_at)
             finally:
                 self._q.task_done()
 

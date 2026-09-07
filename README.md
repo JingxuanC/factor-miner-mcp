@@ -191,6 +191,28 @@ POST /mcp           MCP JSON-RPC（initialize / tools/list / tools/call）
 GET  /jobs/<id>     异步任务状态/结果
 GET  /quota         license 额度余量（鉴权模式）
 GET  /queue-stats   队列概况
+GET  /metrics       Prometheus 指标（无需鉴权）
+```
+
+## 可观察性 / Observability
+
+`GET /metrics` 输出 Prometheus text exposition 格式（无需鉴权，仅工具名级聚合）：
+
+- `mcp_tool_calls_total{tool,status}` — 调用计数，status ∈ ok/error/rejected_license/rejected_quota/queued
+- `mcp_tool_latency_seconds_sum{tool}` / `mcp_tool_latency_seconds_count{tool}` — 延迟累计/次数（异步任务从入队到完成）
+- `mcp_license_check_total{result}` — license 校验计数（ok/invalid）
+- `mcp_uptime_seconds` — 进程启动至今秒数
+- `mcp_queue_depth` — 当前排队任务数（gauge）
+- `mcp_queue_jobs_total{status}` — 异步任务完成计数（done/error）
+
+Prometheus 抓取配置示例：
+
+```yaml
+scrape_configs:
+  - job_name: factor-miner-mcp
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:50053"]
 ```
 
 ## 沙箱安全模型
