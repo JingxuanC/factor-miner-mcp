@@ -130,7 +130,7 @@ class MootdxKline:
     name = "mootdx"
 
     def __init__(self):
-        from server import tdx_client  # noqa: PLC0415 — 延迟导入，单测/无 mootdx 环境可 import 本模块
+        from .fetchers import tdx_client  # noqa: PLC0415 — 延迟导入，单测/无 mootdx 环境可 import 本模块
 
         self._client = tdx_client()
 
@@ -172,7 +172,7 @@ class EastmoneyKline:
     URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
     def _klines(self, code: str, start: str, end: str, fqt: str) -> pd.DataFrame:
-        from server import em_get  # noqa: PLC0415 — 延迟导入
+        from .fetchers import em_get  # noqa: PLC0415 — 延迟导入
 
         secid = ("1." if code[0] in "69" else "0.") + code
         r = em_get(self.URL, params={
@@ -267,7 +267,7 @@ def list_symbols(provider_dir: Path) -> list:
     BJ 股票腾讯/东财日 K 覆盖不全，v1 不含。"""
     codes = []
     try:
-        from server import em_get  # noqa: PLC0415
+        from .fetchers import em_get  # noqa: PLC0415
 
         for mkt in ("m:1+t:2,m:1+t:23", "m:0+t:6,m:0+t:80"):  # 沪A + 深A（含科创/创业）
             pn, pz = 1, 500

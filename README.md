@@ -5,7 +5,7 @@ A 股量化因子挖掘工具集的独立 MCP（Model Context Protocol）服务�
 factor 域，让任何 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研
 Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上线巡检」流水线。
 
-## 工具清单（15 个）
+## 工具清单（16 个）
 
 **因子挖掘**
 
@@ -15,6 +15,7 @@ Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上
 | `factor_backtest` | 全量 qlib 回测：SOTA 因子 + 新因子对齐 Alpha20 baseline，qrun 出指标 | 重（异步） |
 | `factor_oos_check` | 生产准入 OOS 检查：挖掘窗口 vs 纯样本外窗口，报告 IC/年化/回撤 + 衰减 | 重（异步） |
 | `factor_daily_compute` | 每日收盘后计算在线因子，写 Redis `dfactor:{symbol}`（TTL 48h） | 重（异步） |
+| `update_data` | qlib cn_data 每日增量更新（三源熔断 + 原子切换）+ 重建 h5 数据集 | 重（异步） |
 | `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 轻 |
 | `compute_factors` | 从 OHLCV K线计算 Alpha158 风格因子（纯 pandas） | 轻 |
 | `predict` | 因子值 → ML 信号预测 | 轻 |
@@ -94,15 +95,24 @@ docker compose logs -f      # 跟踪日志
 
 ```bash
 curl http://127.0.0.1:50053/health
-curl http://127.0.0.1:50053/tools   # 应返回 15 个工具
+curl http://127.0.0.1:50053/tools   # 应返回 16 个工具
 ```
 
 说明与限制：
 
-- 镜像不含 `pyqlib`（PyPI 无 linux/aarch64 wheel，arm64 需源码编译），
-  因此 `factor_backtest` / `gen_data` / `update_data` 等回测/数据工具
-  在容器内不可用；纯 pandas 工具（`compute_factors` / `predict` /
-  `factor_recent_ic` 等）开箱即用。h5 数据集可通过 volume 挂载：
+- `pyqlib` 按构建架构自动处理（Dockerfile `WITH_QLIB` build-arg，默认 `auto`）：
+  - **amd64**（云服务器常见架构）：自动安装官方 manylinux wheel，
+    `factor_backtest` / `gen_data` / `update_data` 开箱即用；
+  - **aarch64**（Apple Silicon / ARM 服务器）：PyPI 无 linux/aarch64 wheel，
+    默认跳过，回测/数据工具返回明确错误，其余 12 个工具不受影响。
+    需要时用源码编译构建：`docker build --build-arg WITH_QLIB=1`
+    （慢，约 10-20 分钟，构建期需能访问 GitHub；拉不动可换镜像：
+    `--build-arg QLIB_GIT_URL=https://gitee.com/mirrors/qlib.git`）；
+    或直接用 `docker run --platform linux/amd64` 跑 amd64 镜像
+    （QEMU 模拟，慢但能用）。
+  - 完全禁用：`--build-arg WITH_QLIB=0`。
+  国内构建加速：`--build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`。
+- h5 数据集可通过 volume 挂载：
   `- ./data:/app/data` 并设 `FACTOR_MINER_DATA_DIR=/app/data/factor_mining`。
 - `lightgbm` 已随镜像安装（linux wheel 自带 OpenMP 运行时），
   `ml_train_rolling` / `ml_predict` 可用。
@@ -133,6 +143,31 @@ python3 -m factor_miner.gen_data --full      # 全量（回测用）
 
 `factor_recent_ic` / `compute_factors` / `predict` 纯 pandas 实现，
 不依赖 qlib，开箱即用。
+
+## 每日数据同步（update_data）
+
+`update_data` 已封装为 MCP 工具（异步 job）：交易日历对齐 → 三源熔断抓取
+（mootdx → 腾讯 → 东财）→ raw+qfq 复权对齐 → staging 校验 → 原子切换 →
+自动重建 `daily_pv_all.h5`。任一环节失败保留旧数据，退出码非 0。
+
+部署要点：
+
+- **持久化**：qlib cn_data 必须挂卷（compose 里 `./qlib_data:/app/qlib_data` +
+  `QLIB_PROVIDER_URI=/app/qlib_data/cn_data`），否则容器重建数据就没了；
+  h5 数据集挂 `./data:/app/data`。
+- **冷启动**：增量更新从既有 cn_data 日历尾部续抓，首次需要一份基础数据
+  （从现有 Athena 部署拷贝 `~/.qlib/qlib_data/cn_data`，或 qlib 社区 dump），
+  之后每日只增量。
+- **定时调度**：宿主机 crontab 每个交易日收盘后调一次（非交易日自动空转）：
+
+```cron
+# 周一到周五 15:40 / 18:10 各跑一轮（收盘后数据落定有延迟，双轮兜底）
+40 15 * * 1-5 curl -s -X POST http://127.0.0.1:50053/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_data","arguments":{}}}'
+10 18 * * 1-5 curl -s -X POST http://127.0.0.1:50053/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_data","arguments":{}}}'
+```
+
+返回 `job_id`，轮询 `GET /jobs/<id>` 拿结果；也可用 CLI：
+`docker exec factor-miner-mcp python3 -m factor_miner.update_data --limit 10`（冒烟）。
 
 ## 鉴权与额度（可选）
 

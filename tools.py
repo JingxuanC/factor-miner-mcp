@@ -234,6 +234,29 @@ def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
     return analytics.vol_forecast(klines, horizon, method)
 
 
+@tool("update_data", "Incremental update of the qlib cn_data daily bars (trading-calendar aligned, "
+      "raw+qfq dual path, tencent/mootdx/eastmoney circuit-breaker chain, staging + atomic swap), "
+      "then rebuilds the daily_pv_all.h5 factor dataset. Keeps old data on failure. "
+      "Runs as an async job — poll /jobs/<id>. Requires pyqlib + a mounted cn_data baseline. "
+      "Returns JSON string: {ok, exit_code, provider_uri, out_dir}.",
+      {"source": {"type": "string", "enum": ["auto", "tencent", "mootdx", "eastmoney"],
+                  "description": "Data source chain (default auto: mootdx→tencent→eastmoney)", "default": "auto"},
+       "limit": {"type": "integer", "description": "Only update first N symbols (smoke test)", "default": 0},
+       "skip_h5": {"type": "boolean", "description": "Skip daily_pv_all.h5 rebuild", "default": False},
+       "force": {"type": "boolean", "description": "Force backfill even with no new trading day", "default": False}},
+      required=[])
+def update_data(source: str = "auto", limit: int = 0, skip_h5: bool = False, force: bool = False) -> str:
+    import os
+    from factor_miner import update_data as _ud
+    provider_uri = os.environ.get("QLIB_PROVIDER_URI", "~/.qlib/qlib_data/cn_data")
+    out_dir = os.environ.get("FACTOR_MINER_DATA_DIR", "data/factor_mining")
+    rc = _ud.run(provider_uri, out_dir, source=source, limit=limit or None,
+                 skip_h5=skip_h5, force=force)
+    return json.dumps({"ok": rc == 0, "exit_code": rc,
+                       "provider_uri": provider_uri, "out_dir": out_dir},
+                      ensure_ascii=False)
+
+
 # compute_factors / predict 无 @tool schema，由 server 端硬编码补（见 server.py）
 EXTRA_SCHEMAS = {
     "compute_factors": {"name": "compute_factors", "description": "Compute Alpha158 factors from OHLCV data",

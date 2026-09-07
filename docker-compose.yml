@@ -1,6 +1,10 @@
 services:
   factor-miner-mcp:
-    build: .
+    build:
+      context: .
+      # args:                # WITH_QLIB: auto(默认, amd64装wheel/arm64跳过) | 1(arm64源码编译) | 0(禁用)
+      #   WITH_QLIB: auto
+      #   PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple   # 国内构建加速
     image: factor-miner-mcp:latest
     container_name: factor-miner-mcp
     ports:
@@ -13,10 +17,12 @@ services:
       # MCP_QUEUE_SIZE: "50"
       # MCP_USAGE_DIR: /app/usage     # license 用量计数目录
       # REDIS_URL: redis://host.docker.internal:6379/0   # dfactor 缓存（可选，缺失时降级跳过）
-      # FACTOR_MINER_DATA_DIR: /app/data/factor_mining   # h5 数据集目录（回测类工具需要，容器内无 qlib 需外部准备）
+      # FACTOR_MINER_DATA_DIR: /app/data/factor_mining   # h5 数据集目录（回测类工具需要）
+      # QLIB_PROVIDER_URI: /app/qlib_data/cn_data        # qlib 日线数据目录（update_data 增量更新写入）
     volumes:
       # - ./licenses.json:/app/licenses/licenses.json:ro   # license key 文件
       # - ./data:/app/data                                 # h5 数据集（daily_pv.h5 等）
+      # - ./qlib_data:/app/qlib_data                       # qlib cn_data（update_data 持久化，跨容器保留）
       # - ./usage:/app/usage                               # 用量计数持久化
       []
     restart: unless-stopped

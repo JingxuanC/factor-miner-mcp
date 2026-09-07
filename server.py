@@ -40,7 +40,8 @@ SERVER_NAME = "factor-miner-mcp"
 VERSION = "1.0.0"
 
 # 重负载工具：提交后入异步队列执行（返回 job_id 轮询），不占 HTTP 连接。
-ASYNC_TOOLS = {"factor_execute", "factor_backtest", "factor_oos_check", "factor_daily_compute", "ml_train_rolling"}
+ASYNC_TOOLS = {"factor_execute", "factor_backtest", "factor_oos_check", "factor_daily_compute",
+               "ml_train_rolling", "update_data"}
 
 
 class FactorHandler(BaseHTTPRequestHandler):

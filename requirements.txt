@@ -1,6 +1,9 @@
 numpy>=1.26,<2
 pandas>=2.0
 scipy>=1.10
+# 行情抓取（update_data 三源熔断链：腾讯/东财走 requests，mootdx 走 TCP 7709）
+requests>=2.31
+mootdx>=0.11
 # h5 数据集读写（daily_pv.h5 / result.h5）
 pyarrow>=14.0
 tables>=3.9
@@ -15,4 +18,5 @@ lightgbm>=4.3
 # ruptures>=1.1        # change_point 走 PELT
 # arch>=6.0            # vol_forecast 走 GARCH(1,1)
 # ── 可选：qlib 回测/数据导出（factor_backtest / gen_data / update_data）──
-# pyqlib>=0.9.6   # PyPI 无 linux/aarch64 wheel；arm64 需从 GitHub 源码编译
+# pyqlib>=0.9.6   # Docker 构建自动处理（Dockerfile WITH_QLIB）：amd64 装官方
+#                 # wheel；arm64 无 wheel 需 --build-arg WITH_QLIB=1 源码编译
