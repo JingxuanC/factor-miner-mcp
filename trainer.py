@@ -310,7 +310,10 @@ _trainer: Optional[RollingTrainer] = None
 def get_trainer(redis_client=None) -> RollingTrainer:
     global _trainer
     if _trainer is None:
-        _trainer = RollingTrainer(redis_client=redis_client)
+        _trainer = RollingTrainer(
+            redis_client=redis_client,
+            model_dir=os.environ.get("FACTOR_MINER_MODEL_DIR", "/tmp/athena_models"),
+        )
     elif redis_client is not None and _trainer.redis is None:
         _trainer.redis = redis_client
     return _trainer

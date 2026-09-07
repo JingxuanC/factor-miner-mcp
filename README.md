@@ -114,8 +114,10 @@ curl http://127.0.0.1:50053/tools   # 应返回 16 个工具
   国内构建加速：`--build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`。
 - h5 数据集可通过 volume 挂载：
   `- ./data:/app/data` 并设 `FACTOR_MINER_DATA_DIR=/app/data/factor_mining`。
-- `lightgbm` 已随镜像安装（linux wheel 自带 OpenMP 运行时），
-  `ml_train_rolling` / `ml_predict` 可用。
+- `lightgbm` 已随镜像安装（镜像内含 libgomp1 OpenMP 运行时），
+  `ml_train_rolling` / `ml_predict` 可用。训练出的模型默认落在容器
+  `/tmp/athena_models/`（重建即丢），生产部署请挂卷并设
+  `FACTOR_MINER_MODEL_DIR=/app/models`。
 - Redis 缓存（`dfactor:*` 写入）可选：设置 `REDIS_URL` 指向可达的
   Redis，缺失时自动降级跳过缓存写入。
 

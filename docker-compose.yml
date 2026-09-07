@@ -18,11 +18,13 @@ services:
       # MCP_USAGE_DIR: /app/usage     # license 用量计数目录
       # REDIS_URL: redis://host.docker.internal:6379/0   # dfactor 缓存（可选，缺失时降级跳过）
       # FACTOR_MINER_DATA_DIR: /app/data/factor_mining   # h5 数据集目录（回测类工具需要）
+      # FACTOR_MINER_MODEL_DIR: /app/models              # LGBM 模型目录（默认 /tmp/athena_models，容器重建即丢，建议挂卷）
       # QLIB_PROVIDER_URI: /app/qlib_data/cn_data        # qlib 日线数据目录（update_data 增量更新写入）
     volumes:
       # - ./licenses.json:/app/licenses/licenses.json:ro   # license key 文件
       # - ./data:/app/data                                 # h5 数据集（daily_pv.h5 等）
       # - ./qlib_data:/app/qlib_data                       # qlib cn_data（update_data 持久化，跨容器保留）
       # - ./usage:/app/usage                               # 用量计数持久化
+      # - ./models:/app/models                             # LGBM 模型持久化（配合 FACTOR_MINER_MODEL_DIR）
       []
     restart: unless-stopped

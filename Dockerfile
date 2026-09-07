@@ -6,7 +6,8 @@ FROM python:3.11-slim
 #                 factor_backtest/gen_data/update_data 返回明确错误，其余工具不受影响
 #   1           ：aarch64 从 GitHub 源码编译（慢，一次性；需构建期可访问 GitHub）
 #   0           ：任何架构都不装
-# lightgbm 的 linux wheel 自带 OpenMP 运行时，直接可用。
+# lightgbm 的 linux wheel 不自带 OpenMP 运行时，slim 镜像需显式装 libgomp1，
+# 否则 import 时 OSError: libgomp.so.1 cannot open shared object file
 ARG WITH_QLIB=auto
 # WITH_QLIB=1（arm64 源码编译）时的 qlib 仓库地址，拉不动 GitHub 可换镜像
 ARG QLIB_GIT_URL=https://github.com/microsoft/qlib.git
@@ -21,6 +22,10 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
 RUN pip install -r requirements.txt \
