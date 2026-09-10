@@ -24,8 +24,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
+    && apt-get install -y --no-install-recommends libgomp1 sudo \
     && rm -rf /var/lib/apt/lists/*
+
+# 沙箱降权：只允许 appuser 以 nobody 身份跑 python3（factor_miner/sandbox.py），
+# SETENV 标签放行沙箱构造的最小环境变量（PATH/HOME/PYTHONPATH/LANG）
+RUN echo 'appuser ALL=(#65534) NOPASSWD:SETENV: /usr/local/bin/python3' > /etc/sudoers.d/factor-sandbox \
+    && chmod 440 /etc/sudoers.d/factor-sandbox
 
 COPY requirements.txt ./
 RUN pip install -r requirements.txt \
