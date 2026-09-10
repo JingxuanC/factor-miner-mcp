@@ -3,7 +3,9 @@ RollingTrainer: expanding-window LGBM training for daily stock prediction.
 
 Qlib-inspired workflow:
   1. Receive raw OHLCV klines from Go side (via /train/rolling endpoint)
-  2. Internally compute Alpha158/360 factors + label (next-day return) from klines
+  2. Point-in-time feature extraction: for each day i, recompute Alpha158
+     factors on klines[:i+1] — the exact same snapshot predict() would see
+     at close of day i; label is the next-day return
   3. Each training cycle: train on expanding window, validate on tail
   4. Save model to disk, produce next-day predictions → Redis pred:{sym}
 
@@ -72,50 +74,47 @@ class RollingTrainer:
     # ── feature + label extraction ────────────────────────────────────
 
     def extract_features(
-        self, klines: list, labels: list
+        self, klines: list, labels: list, min_history: int = 60, step: int = 1
     ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
-        """Compute factors ONCE on full window, reuse for all historical rows.
+        """Point-in-time extraction: one feature row per day.
 
-        O(n) instead of O(n²): FactorEngine.compute() called once per stock,
-        then all rows share the same feature vector (only labels differ).
-
-        This is the point-in-time approximation — factors are slow-moving enough
-        that a single snapshot works for past labels in daily-frequency training.
+        For each day i (i >= min_history-1), factors are recomputed on the
+        prefix klines[:i+1] — identical semantics to what predict() sees at
+        the close of day i (no look-ahead). Costs O(n²) per stock instead of
+        O(n); step > 1 subsamples days to trade sample count for speed.
         """
         if self._factor_engine is None:
             return np.array([]), np.array([]), [], []
 
-        # Compute factors once on the full klines window
-        result = self._factor_engine.compute({
-            "symbol": "",
-            "klines": [
-                {"date": k.get("date", ""),
-                 "open": float(k.get("open", 0)),
-                 "high": float(k.get("high", 0)),
-                 "low": float(k.get("low", 0)),
-                 "close": float(k.get("close", 0)),
-                 "volume": float(k.get("volume", 0))}
-                for k in klines
-            ],
-        })
-        feats = result.get("factors", {})
-        if not feats:
-            return np.array([]), np.array([]), [], []
+        norm = [
+            {"date": k.get("date", ""),
+             "open": float(k.get("open", 0)),
+             "high": float(k.get("high", 0)),
+             "low": float(k.get("low", 0)),
+             "close": float(k.get("close", 0)),
+             "volume": float(k.get("volume", 0))}
+            for k in klines
+        ]
 
-        if self._feature_names is None:
-            self._feature_names = sorted(feats.keys())
-        feat_row = [feats.get(k, 0.0) for k in self._feature_names]
-
-        # One row per day with valid label (all share same factor vector)
+        feat_names = self._feature_names
         X_rows, y_rows, date_rows = [], [], []
-        for i in range(len(klines) - 1):  # last row has no label
+        for i in range(max(min_history - 1, 1), len(klines) - 1, max(step, 1)):
             lbl = labels[i]
             if math.isnan(lbl) or math.isinf(lbl):
                 continue
-            X_rows.append(feat_row)
+            feats = self._factor_engine.compute(
+                {"symbol": "", "klines": norm[:i + 1]}
+            ).get("factors", {})
+            if not feats:
+                continue
+            if feat_names is None:
+                feat_names = sorted(feats.keys())
+            X_rows.append([feats.get(k, 0.0) for k in feat_names])
             y_rows.append(lbl)
             date_rows.append(klines[i].get("date", ""))
 
+        if self._feature_names is None and feat_names:
+            self._feature_names = feat_names
         if not X_rows:
             return np.array([]), np.array([]), [], []
         return (
@@ -132,6 +131,8 @@ class RollingTrainer:
         klines_list: List[dict],  # [{symbol, klines: [...]}, ...]
         validation_days: int = 20,
         early_stopping_rounds: int = 20,
+        min_history: int = 60,
+        step: int = 1,
     ) -> dict:
         """Run one expanding-window training cycle.
 
@@ -139,6 +140,8 @@ class RollingTrainer:
             klines_list: [{symbol: "600519", klines: [{date, open, high, low, close, volume}, ...]}, ...]
             validation_days: tail samples for validation
             early_stopping_rounds: LGBM patience
+            min_history: 首日所需最短历史（ma_60 需要 60；更小则前期因子失真）
+            step: 按日抽样步长（>1 时减少样本换速度）
 
         Returns:
             {status, ic, rank_ic, sharpe, n_samples, n_features, trained_at}
@@ -155,10 +158,11 @@ class RollingTrainer:
         for item in klines_list:
             sym = item.get("symbol", "")
             klines = item.get("klines", [])
-            if len(klines) < 30:
+            if len(klines) < max(30, min_history + 2):
                 continue
             labels = compute_labels(klines)
-            X, y, dates, _ = self.extract_features(klines, labels)
+            X, y, dates, _ = self.extract_features(
+                klines, labels, min_history=min_history, step=step)
             if len(X) == 0:
                 continue
             # Per-stock split: last validation_days rows → val, rest → train
@@ -211,6 +215,12 @@ class RollingTrainer:
         with open(self.model_path, "wb") as f:
             pickle.dump(model, f)
 
+        top_feats = []
+        if self._feature_names:
+            imp = sorted(zip(self._feature_names, model.feature_importances_),
+                         key=lambda kv: kv[1], reverse=True)
+            top_feats = [{"feature": n, "importance": int(v)} for n, v in imp[:20]]
+
         self.last_train_at = today
         self.metrics[today] = {
             "ic": round(ic, 4),
@@ -219,6 +229,7 @@ class RollingTrainer:
             "top10_return": round(top10_ret, 6),
             "n_samples": len(y),
             "n_features": X.shape[1],
+            "feature_importance_top20": top_feats,
         }
 
         return {
@@ -231,6 +242,7 @@ class RollingTrainer:
             "top10_return": round(top10_ret, 6),
             "n_samples": len(y),
             "n_features": X.shape[1],
+            "feature_importance_top20": top_feats,
             "duration_ms": int((time.time() - t0) * 1000),
         }
 

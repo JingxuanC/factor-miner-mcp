@@ -131,17 +131,22 @@ HANDLERS.setdefault("predict", _predict_handler)
 # lightgbm 缺失时 trainer 内部优雅降级（status=error），服务照常启动。
 # ═══════════════════════════════════════════════════════════════
 
-@tool("ml_train_rolling", "Rolling LGBM training on expanding window: computes Alpha158-style "
-      "factors + next-day-return labels from raw OHLCV klines, trains LGBMRegressor, "
-      "evaluates IC/rank_ic/sharpe on the validation tail, saves model to disk. "
+@tool("ml_train_rolling", "Rolling LGBM training on expanding window: point-in-time Alpha158-style "
+      "factors (recomputed per day on the history prefix, no look-ahead) + next-day-return labels "
+      "from raw OHLCV klines, trains LGBMRegressor, evaluates IC/rank_ic/sharpe on the validation "
+      "tail, saves model to disk. "
       "Returns JSON string: {status, ic, rank_ic, sharpe, n_samples, n_features, model_path}.",
-      {"klines_list": {"type": "array", "description": "[{symbol, klines: [{date,open,high,low,close,volume}, ...]}, ...] (>=30 klines per symbol)"},
+      {"klines_list": {"type": "array", "description": "[{symbol, klines: [{date,open,high,low,close,volume}, ...]}, ...] (>=62 klines per symbol)"},
        "validation_days": {"type": "integer", "description": "Tail samples for validation (default 20)", "default": 20},
-       "early_stopping_rounds": {"type": "integer", "description": "LGBM patience (default 20)", "default": 20}},
+       "early_stopping_rounds": {"type": "integer", "description": "LGBM patience (default 20)", "default": 20},
+       "min_history": {"type": "integer", "description": "Min history days before a row is used (default 60, needed by ma_60)", "default": 60},
+       "step": {"type": "integer", "description": "Day sampling stride, >1 trades sample count for speed (default 1)", "default": 1}},
       required=["klines_list"])
-def ml_train_rolling(klines_list: list, validation_days: int = 20, early_stopping_rounds: int = 20) -> str:
+def ml_train_rolling(klines_list: list, validation_days: int = 20, early_stopping_rounds: int = 20,
+                     min_history: int = 60, step: int = 1) -> str:
     from trainer import get_trainer
-    return json.dumps(get_trainer().train(klines_list, validation_days, early_stopping_rounds))
+    return json.dumps(get_trainer().train(klines_list, validation_days, early_stopping_rounds,
+                                          min_history=min_history, step=step))
 
 
 @tool("ml_predict", "Next-day return predictions from the trained rolling model. "
@@ -237,7 +242,7 @@ def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
 @tool("update_data", "Incremental update of the qlib cn_data daily bars (trading-calendar aligned, "
       "raw+qfq dual path, tencent/mootdx/eastmoney circuit-breaker chain, staging + atomic swap), "
       "then rebuilds the daily_pv_all.h5 factor dataset. Keeps old data on failure. "
-      "Runs as an async job — poll /jobs/<id>. Requires pyqlib + a mounted cn_data baseline. "
+      "Runs as an async job — poll with the job_status tool. Requires pyqlib + a mounted cn_data baseline. "
       "Returns JSON string: {ok, exit_code, provider_uri, out_dir}.",
       {"source": {"type": "string", "enum": ["auto", "tencent", "mootdx", "eastmoney"],
                   "description": "Data source chain (default auto: mootdx→tencent→eastmoney)", "default": "auto"},

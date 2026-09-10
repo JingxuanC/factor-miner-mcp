@@ -45,6 +45,19 @@ VERSION = "1.0.0"
 ASYNC_TOOLS = {"factor_execute", "factor_backtest", "factor_oos_check", "factor_daily_compute",
                "ml_train_rolling", "update_data"}
 
+# 异步任务查询工具（不走 HANDLERS，在 _handle_mcp 里特殊处理；查状态不扣额度）
+JOB_STATUS_SCHEMA = {
+    "name": "job_status",
+    "description": "查询异步任务状态/结果。传入提交重任务时返回的 job_id，"
+                   "返回 status（queued/running/done/error）、result 或 error、elapsed_sec。"
+                   "重任务提交后用它轮询，无需直接 HTTP 访问 GET /jobs/<id>。",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"job_id": {"type": "string", "description": "异步任务 ID"}},
+        "required": ["job_id"],
+    },
+}
+
 
 class FactorHandler(BaseHTTPRequestHandler):
     license_store: LicenseStore | None = None
@@ -64,7 +77,23 @@ class FactorHandler(BaseHTTPRequestHandler):
     def _tool_schemas(self):
         schemas = [t.to_dict() for t in TOOLS.values()]
         schemas.extend(EXTRA_SCHEMAS.values())
+        if self.job_queue:
+            schemas.append(JOB_STATUS_SCHEMA)
         return schemas
+
+    def _job_status(self, mid, tool_args):
+        job_id = str(tool_args.get("job_id", "")).strip()
+        job = (self.job_queue.get(job_id, key=self._license_key())
+               if job_id and self.job_queue else None)
+        if job is None:
+            payload = {"job_id": job_id, "status": "not_found",
+                       "note": "任务不存在/结果已过期（默认保留 1h），或不属于当前 license key"}
+        else:
+            payload = job
+        METRICS.inc_call("job_status", "ok")
+        self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+            "isError": False}})
 
     def _license_key(self) -> str:
         return self.headers.get("X-License-Key", "")
@@ -162,6 +191,9 @@ class FactorHandler(BaseHTTPRequestHandler):
                     self._send(200, {"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32001, "message": info}})
                     return
+            if tool_name == "job_status":
+                self._job_status(mid, tool_args)
+                return
             if tool_name not in HANDLERS:
                 self._send(200, {"jsonrpc": "2.0", "id": mid,
                                  "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}})
@@ -189,7 +221,7 @@ class FactorHandler(BaseHTTPRequestHandler):
                     "content": [{"type": "text", "text": json.dumps({
                         "job_id": job_id, "status": "queued",
                         "poll": f"/jobs/{job_id}",
-                        "note": "重任务已入队，轮询 GET /jobs/<id> 拿结果",
+                        "note": "重任务已入队，调用 job_status 工具传入 job_id 轮询拿结果",
                     }, ensure_ascii=False)}], "isError": False}})
                 return
             # 同步执行：记 ok/error + 延迟（异步任务在 JobQueue._worker 完成时记）
