@@ -24,9 +24,39 @@ Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上
 
 | 工具 | 说明 | 负载 |
 |------|------|------|
-| `ml_train_rolling` | 滚动 LGBM 训练：K线 → Alpha158 因子 + 次日收益标签 → 扩张窗训练，输出 IC/RankIC/Sharpe | 重（异步） |
-| `ml_predict` | 用滚动模型出次日收益预测（优先 Redis 因子快照，回退实时计算） | 轻 |
-| `ml_metrics` | 训练器状态：最近训练日、逐日指标、模型是否存在、特征清单 | 轻 |
+| `ml_train_rolling` | 滚动训练：K线 → Alpha158 因子 + 次日收益标签 → 扩张窗训练，输出 IC/RankIC/Sharpe。`model="lgbm"`（默认）走 LGBM；`model="master"` 走 MASTER 深度学习后端 | 重（异步） |
+| `ml_predict` | 用滚动模型出次日收益预测（lgbm 优先 Redis 因子快照；master 用最近 seq_len 天特征序列） | 轻 |
+| `ml_metrics` | 训练器状态：最近训练日、逐日指标、模型类型（lgbm/master）、特征清单 | 轻 |
+
+### MASTER 深度学习后端（`model="master"`）
+
+[MASTER](https://github.com/SJTU-DMTai/MASTER)（AAAI 2024，微软 qlib
+benchmark 收录）是股票专用 Transformer：日内时序注意力（TAttention）+
+截面股票间注意力（SAttention）+ market-guided gating（用市场上下文门控
+个股特征）。本实现复用与 LGBM 相同的 point-in-time Alpha158 因子（无未来
+函数），batch 为「同一交易日的全部股票截面」，市场上下文取当日截面特征的
+mean/std。网络结构 vendor 自官方仓库（`factor_miner/master_nn.py`，MIT）。
+
+```json
+// 训练（异步 job，返回 job_id 后用 job_status 轮询）
+{"name": "ml_train_rolling", "arguments": {
+  "model": "master", "klines_list": [...], "seq_len": 8, "epochs": 3}}
+// 预测 / 状态
+{"name": "ml_predict", "arguments": {"model": "master", "klines_list": [...]}}
+{"name": "ml_metrics", "arguments": {}}
+```
+
+注意事项：
+
+- **截面模型**：至少 4 只有效股票才训练（建议 ≥10 只）；`max_symbols`
+  默认 50 上限校验（CPU 保护）。
+- **CPU 默认值偏小**：`seq_len=8` / `epochs=3` / `d_model=64`，
+  `torch.set_num_threads(2)`。2 核 / 3G 内存服务器上，20 股 × 2 年
+  量级约几分钟（瓶颈在逐日因子重算，与 LGBM 路径相同）；加大 epochs
+  或股票数会线性变慢，训练全程走异步 job 不占 HTTP 连接。
+- 特征归一化统计量只用训练段，模型 + 归一化器一起存
+  `FACTOR_MINER_MODEL_DIR/master.pt`。
+- 需要 torch（CPU 版，Docker 镜像已内置；本地 `pip install torch`）。
 
 **因子评估与组合**
 
@@ -118,6 +148,12 @@ curl http://127.0.0.1:50053/tools   # 应返回 16 个工具
   `ml_train_rolling` / `ml_predict` 可用。训练出的模型默认落在容器
   `/tmp/athena_models/`（重建即丢），生产部署请挂卷并设
   `FACTOR_MINER_MODEL_DIR=/app/models`。
+- `torch`（CPU 版）已随镜像安装（MASTER 深度学习后端）：离线/代理环境
+  可把预下载的 torch CPU wheel 放进 `wheels/`（文件名 `torch-*.whl`）
+  构建期离线安装；否则按 `PIP_INDEX_URL` / 官方 CPU 源在线装。
+  注意镜像体积因此增加约 300-800MB（视 torch 版本），3G 内存服务器
+  训练 MASTER 时建议股票数 ≤50、epochs ≤5，避免与 qlib 回测类重任务
+  并发（队列 worker 数可用 `MCP_WORKERS=1` 压低）。
 - Redis 缓存（`dfactor:*` 写入）可选：设置 `REDIS_URL` 指向可达的
   Redis，缺失时自动降级跳过缓存写入。
 
@@ -227,6 +263,8 @@ AST import 白名单（仅 pandas/numpy 等）、rlimit 资源限制、120s 超�
 
 - `factor_miner/gen_data.py` 移植自 microsoft/RD-Agent（MIT）
 - `factor_miner/qlib_dump_bin.py` 裁剪自 microsoft/qlib v0.9.6（MIT）
+- `factor_miner/master_nn.py` vendor 自 SJTU-DMTai/MASTER（AAAI 2024，MIT）的
+  qlib 提交版（qlib 0.9.7 的 contrib 未合入 MASTER，故本地内置）
 - 本项目主体来自 [Athena](https://github.com/JingxuanC/Athena)
 
 ## License

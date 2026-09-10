@@ -32,6 +32,28 @@ RUN apt-get update \
 RUN echo 'appuser ALL=(#65534) NOPASSWD:SETENV: /usr/local/bin/python3' > /etc/sudoers.d/factor-sandbox \
     && chmod 440 /etc/sudoers.d/factor-sandbox
 
+# torch CPU 版（MASTER 深度学习后端，ml_train_rolling model="master"）：
+# 装法与 kronos-mcp 一致——wheels/ 内若预置 torch-*.whl（如预下载的
+# linux/aarch64 CPU wheel）则离线 --no-deps 安装（PyPI 的 linux torch
+# 会拖 GB 级 CUDA 依赖，--no-deps 规避；真实运行依赖下一行显式装）；
+# 否则按 PIP_INDEX_URL / 官方 CPU 源在线装。wheels/ 内置 PySocks+socksio
+# 使 pip 支持 socks 代理（Docker Desktop 注入 ~/.docker/config.json proxies）。
+# 该层独立于 requirements.txt，改动业务依赖不破坏 torch 层缓存。
+COPY wheels/ /tmp/wheels/
+RUN pip install --no-index --find-links=/tmp/wheels pysocks socksio \
+ && if ls /tmp/wheels/torch-*.whl >/dev/null 2>&1; then \
+      echo "using vendored torch wheel"; \
+      pip install --no-deps /tmp/wheels/torch-*.whl \
+   && pip install ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} \
+        filelock "typing-extensions>=4.10" "sympy>=1.13.3" "networkx>=2.5.1" \
+        jinja2 "fsspec>=0.2.3" setuptools; \
+    elif [ -n "$PIP_INDEX_URL" ]; then \
+      pip install --index-url "$PIP_INDEX_URL" torch; \
+    else \
+      pip install torch --index-url https://download.pytorch.org/whl/cpu; \
+    fi \
+ && rm -rf /tmp/wheels
+
 COPY requirements.txt ./
 RUN pip install -r requirements.txt \
     && arch="$(dpkg --print-architecture)" \

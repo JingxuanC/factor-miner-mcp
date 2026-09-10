@@ -12,6 +12,11 @@ redis>=5.0
 # ML 滚动训练（ml_train_rolling/ml_predict/ml_metrics）；缺失时服务照常
 # 启动，训练工具返回明确错误。macOS 需先 brew install libomp
 lightgbm>=4.3
+# MASTER 深度学习后端（ml_train_rolling model="master"）：本地安装直接随本
+# 文件解析（macOS wheel 即 CPU/MPS 版）；Docker 镜像在 Dockerfile 里先用
+# CPU index-url / wheels/ 离线包单独装一层以控制体积（此处仅作版本声明，
+# 镜像内 pip 看到已装即跳过）
+torch>=2.2
 # ── 可选：因子评估与组合分析增强（缺库时自动回退内置实现，不阻塞）──
 # PyPortfolioOpt>=1.5  # portfolio_optimize method="mean_variance"（注意 PyPI 包名）
 # hmmlearn>=0.3        # regime_detect 走 GaussianHMM

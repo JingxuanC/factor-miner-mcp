@@ -127,40 +127,61 @@ HANDLERS.setdefault("predict", _predict_handler)
 
 
 # ═══════════════════════════════════════════════════════════════
-# ML 滚动训练（RollingTrainer：Alpha158 因子 + 次日收益标签 → LGBM）
-# lightgbm 缺失时 trainer 内部优雅降级（status=error），服务照常启动。
+# ML 滚动训练（RollingTrainer：Alpha158 因子 + 次日收益标签 → LGBM 或 MASTER）
+# lightgbm/torch 缺失时 trainer 内部优雅降级（status=error），服务照常启动。
 # ═══════════════════════════════════════════════════════════════
 
-@tool("ml_train_rolling", "Rolling LGBM training on expanding window: point-in-time Alpha158-style "
+@tool("ml_train_rolling", "Rolling training on expanding window: point-in-time Alpha158-style "
       "factors (recomputed per day on the history prefix, no look-ahead) + next-day-return labels "
-      "from raw OHLCV klines, trains LGBMRegressor, evaluates IC/rank_ic/sharpe on the validation "
-      "tail, saves model to disk. "
-      "Returns JSON string: {status, ic, rank_ic, sharpe, n_samples, n_features, model_path}.",
-      {"klines_list": {"type": "array", "description": "[{symbol, klines: [{date,open,high,low,close,volume}, ...]}, ...] (>=62 klines per symbol)"},
+      "from raw OHLCV klines. model='lgbm' (default) trains LGBMRegressor; model='master' trains "
+      "MASTER (AAAI 2024 股票专用 Transformer，截面 batch + market-guided gating，torch CPU). "
+      "Evaluates IC/rank_ic/sharpe on the validation tail, saves model to disk. "
+      "Returns JSON string: {status, model_type, ic, rank_ic, sharpe, n_samples, n_features, model_path, ...}.",
+      {"klines_list": {"type": "array", "description": "[{symbol, klines: [{date,open,high,low,close,volume}, ...]}, ...] (>=62 klines per symbol; master 为截面模型，建议 >=10 只股票)"},
+       "model": {"type": "string", "enum": ["lgbm", "master"], "description": "训练后端（默认 lgbm，向后兼容）", "default": "lgbm"},
        "validation_days": {"type": "integer", "description": "Tail samples for validation (default 20)", "default": 20},
-       "early_stopping_rounds": {"type": "integer", "description": "LGBM patience (default 20)", "default": 20},
+       "early_stopping_rounds": {"type": "integer", "description": "LGBM patience (default 20, 仅 lgbm)", "default": 20},
        "min_history": {"type": "integer", "description": "Min history days before a row is used (default 60, needed by ma_60)", "default": 60},
-       "step": {"type": "integer", "description": "Day sampling stride, >1 trades sample count for speed (default 1)", "default": 1}},
+       "step": {"type": "integer", "description": "Day sampling stride, >1 trades sample count for speed (default 1)", "default": 1},
+       "seq_len": {"type": "integer", "description": "MASTER lookback 序列长度（默认 8，仅 master）", "default": 8},
+       "epochs": {"type": "integer", "description": "MASTER 训练轮数（默认 3，CPU 保护；仅 master）", "default": 3},
+       "d_model": {"type": "integer", "description": "MASTER 隐层维度（默认 64；仅 master）", "default": 64},
+       "lr": {"type": "number", "description": "MASTER Adam 学习率（默认 3e-4；仅 master）", "default": 0.0003},
+       "max_symbols": {"type": "integer", "description": "MASTER 股票数上限校验（默认 50，CPU 保护；仅 master）", "default": 50}},
       required=["klines_list"])
-def ml_train_rolling(klines_list: list, validation_days: int = 20, early_stopping_rounds: int = 20,
-                     min_history: int = 60, step: int = 1) -> str:
+def ml_train_rolling(klines_list: list, model: str = "lgbm", validation_days: int = 20,
+                     early_stopping_rounds: int = 20, min_history: int = 60, step: int = 1,
+                     seq_len: int = 8, epochs: int = 3, d_model: int = 64,
+                     lr: float = 3e-4, max_symbols: int = 50) -> str:
     from trainer import get_trainer
-    return json.dumps(get_trainer().train(klines_list, validation_days, early_stopping_rounds,
-                                          min_history=min_history, step=step))
+    trainer = get_trainer()
+    if model == "master":
+        return json.dumps(trainer.train_master(
+            klines_list, validation_days=validation_days, min_history=min_history,
+            step=step, seq_len=seq_len, epochs=epochs, d_model=d_model, lr=lr,
+            max_symbols=max_symbols))
+    return json.dumps(trainer.train(klines_list, validation_days, early_stopping_rounds,
+                                    min_history=min_history, step=step))
 
 
 @tool("ml_predict", "Next-day return predictions from the trained rolling model. "
-      "Prefers Redis factor:{symbol} snapshots, falls back to on-the-fly factor compute. "
+      "model='lgbm' (default) prefers Redis factor:{symbol} snapshots, falls back to on-the-fly "
+      "factor compute; model='master' 用最近 seq_len 天特征序列出分（需先 model='master' 训练）。 "
       "Returns JSON string: {status, n_predicted, predictions: {symbol: score}}.",
-      {"klines_list": {"type": "array", "description": "[{symbol, klines: [...]}, ...] (klines used when no Redis snapshot)"}},
+      {"klines_list": {"type": "array", "description": "[{symbol, klines: [...]}, ...] (klines used when no Redis snapshot; master 至少需 seq_len 根)"},
+       "model": {"type": "string", "enum": ["lgbm", "master"], "description": "预测后端（默认 lgbm，向后兼容）", "default": "lgbm"}},
       required=["klines_list"])
-def ml_predict(klines_list: list) -> str:
+def ml_predict(klines_list: list, model: str = "lgbm") -> str:
     from trainer import get_trainer
-    return json.dumps(get_trainer().predict(klines_list))
+    trainer = get_trainer()
+    if model == "master":
+        return json.dumps(trainer.predict_master(klines_list))
+    return json.dumps(trainer.predict(klines_list))
 
 
 @tool("ml_metrics", "Rolling trainer status: last training date, per-day metrics "
-      "(ic/rank_ic/sharpe/top10_return), model existence, feature names.",
+      "(ic/rank_ic/sharpe/top10_return), model existence, feature names; "
+      "model_type 标注模型类型（lgbm/master），master 块单独报告深度学习模型状态。",
       {})
 def ml_metrics() -> str:
     from trainer import get_trainer
