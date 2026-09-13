@@ -36,7 +36,7 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
         TOOLS[name] = ToolDef(name, description, {
             "type": "object",
             "properties": properties,
-            "required": required or list(properties.keys()),
+            "required": required or [],
         })
         HANDLERS[name] = fn
         return fn
@@ -286,7 +286,9 @@ def update_data(source: str = "auto", limit: int = 0, skip_h5: bool = False, for
 # compute_factors / predict 无 @tool schema，由 server 端硬编码补（见 server.py）
 EXTRA_SCHEMAS = {
     "compute_factors": {"name": "compute_factors", "description": "Compute Alpha158 factors from OHLCV data",
-                        "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}, "klines": {"type": "array"}}}},
+                        "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}, "klines": {"type": "array"}},
+                                        "required": []}},
     "predict": {"name": "predict", "description": "ML model prediction from factor values",
-                "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}, "factors": {"type": "object"}}}},
+                "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}, "factors": {"type": "object"}},
+                                "required": []}},
 }
