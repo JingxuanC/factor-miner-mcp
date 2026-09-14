@@ -489,6 +489,11 @@ def write_daily_factors_to_redis(values: dict, ttl: int = DFACTOR_TTL,
                                  redis_client=None) -> int:
     """合并后的 live 因子值写 Redis：dfactor:{symbol} → {name: value}，TTL 48h。
 
+    symbol 一律**转小写**再拼键：写入侧的 symbol 来自 qlib instrument 名（`SH600340`
+    大写），而读取侧 athena 的 `factor.Store.GetDaily` 拼的是 `dkeyPrefix + q.Symbol`，
+    其 symbol 约定是小写（`sh600340`）。Redis 键大小写敏感，不归一就会出现
+    "写进去了但 MGet 全是 nil"的静默失联（2026-09-14 实际发生）。
+
     redis_client 为 None 时走 _get_redis()；测试可传 fake client 或
     monkeypatch _get_redis。返回成功写入的 key 数；redis 不可用返回 0。
     """
@@ -500,7 +505,7 @@ def write_daily_factors_to_redis(values: dict, ttl: int = DFACTOR_TTL,
         if not factors:
             continue
         try:
-            r.setex(DFACTOR_PREFIX + symbol, ttl, json.dumps(factors))
+            r.setex(DFACTOR_PREFIX + str(symbol).lower(), ttl, json.dumps(factors))
             written += 1
         except Exception:  # noqa: BLE001 — 单 symbol 写失败不阻塞其余
             continue
