@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from mcp_common import coerce_args
 
 logger = logging.getLogger("mcp-gateway")
 
@@ -386,6 +387,19 @@ class JobQueue:
         return self._handler_timeout
 
     def submit(self, tool: str, args: dict, key: str = "") -> str:
+        # 参数类型强制（mcp-common）：LLM 常把数字传成字符串（lookback_days="60"）
+        # 或显式传 null，直接 **args 解包会在 handler 内抛 TypeError 且无法指导纠正。
+        # 这里立即返回一个已是 error 的 job —— 不占 worker、不触发并发闸。
+        args, _arg_err = coerce_args(self._handlers, tool, args)
+        if _arg_err is not None:
+            _jid = uuid.uuid4().hex[:12]
+            with self._mu:
+                self._jobs[_jid] = {
+                    "id": _jid, "tool": tool, "key": key, "owner": key or _ANON_OWNER, "status": "error",
+                    "created_at": time.time(), "finished_at": time.time(),
+                    "result": None, "error": _arg_err,
+                }
+            return _jid
         # 单 owner 并发闸：已有 queued/running 的重任务 → 拒绝。
         # owner = license key；key="" 的开放模式退化为 _ANON_OWNER 全局单飞
         # （旧实现 `if j["key"] == key and key` 在 key="" 时闸门完全失效）。
