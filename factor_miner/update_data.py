@@ -682,10 +682,36 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
     # 昨日抓取失败/漏更的股票今天自动补齐缺口（而不是永远留 NaN 洞）。
     backfill_days = calendar[-30:] + [pd.Timestamp(d) for d in new_days]
 
-    csv_dir = Path(tempfile.mkdtemp(prefix="qlib_csv_"))
+    # 断点续抓：FACTOR_MINER_CSV_DIR 指定沿用上一轮的抓取目录（默认新建临时目录），
+    # FACTOR_MINER_CSV_RESUME=1 时已存在的 CSV 直接复用、只补缺失的票。
+    # 抓 5000+ 只票走的是免费源（约 1 只/秒，一跑 1.5 小时），中断后从头再来
+    # 代价极高——而中断（进程被杀/容器重启）并不会损坏 provider 目录，
+    # 因为落库是最后一步的原子 swap。这个开关让那一小时的抓取不白费。
+    csv_dir = Path(os.environ.get("FACTOR_MINER_CSV_DIR") or tempfile.mkdtemp(prefix="qlib_csv_"))
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    resume = os.environ.get("FACTOR_MINER_CSV_RESUME") == "1"
+    reused = 0
     updated, new_syms, failed, last_day_hits = [], [], 0, 0
     try:
         for i, code in enumerate(symbols):
+            fname = (market_of(code) + code).upper()
+            is_new = fname not in old_end
+            csv_path = csv_dir / f"{market_of(code)}{code}.csv"
+            if resume and csv_path.exists():
+                # 复用上一轮已抓好的 CSV，且按与抓取路径相同的口径计入 last_day_hits，
+                # 否则覆盖率守卫会被"复用的票不算命中"错误触发。
+                reused += 1
+                try:
+                    tail = pd.read_csv(csv_path, usecols=["close"]).tail(1)
+                    if not tail.empty and not np.isnan(float(tail["close"].iloc[-1])):
+                        last_day_hits += 1
+                except (OSError, ValueError, KeyError) as e:
+                    log.warning("%s 复用 CSV 读取失败，改为重新抓取: %s", code, e)
+                    reused -= 1
+                    csv_path.unlink(missing_ok=True)
+                else:
+                    (new_syms if is_new else updated).append(code)
+                    continue
             try:
                 raw, qfq = fetcher.fetch_stock(code, start, today)
             except FetchError as e:
@@ -694,8 +720,6 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
                     log.error("数据源全挂，中止: %s", e)
                     return EXIT_NO_SOURCE
                 continue
-            fname = (market_of(code) + code).upper()
-            is_new = fname not in old_end
             scale = 1.0
             if not is_new:
                 old_close = read_bin_tail(provider_dir, code, "close", calendar, old_end[fname])
@@ -731,8 +755,8 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
             log.error("最近交易日 %s 覆盖率过低 (%d/%d)，数据未就绪，保留旧数据",
                       new_days[-1], last_day_hits, total)
             return EXIT_VALIDATE
-        log.info("抓取完成: 存量更新 %d, 新上市 %d, 失败 %d, 耗时 %.0fs",
-                 len(updated), len(new_syms), failed, time.time() - t_run)
+        log.info("抓取完成: 存量更新 %d, 新上市 %d, 失败 %d, 复用 %d, 耗时 %.0fs",
+                 len(updated), len(new_syms), failed, reused, time.time() - t_run)
 
         # 3. staging 副本 + dump_bin 增量
         log.info("复制 cn_data → staging ...")

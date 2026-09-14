@@ -384,3 +384,57 @@ def test_run_allows_explicit_small_symbols(tmp_path):
                 symbols=["000001", "600519"], skip_h5=True)
     assert rc == ud.EXIT_OK
     assert ud.read_calendar(prov)[-1] == pd.Timestamp("2026-08-27")
+
+
+# ═══════════ 回归: 断点续抓（进程被杀/容器重启后不白费已抓的一小时）═══════════
+
+def test_resume_reuses_existing_csv(tmp_path, monkeypatch):
+    """FACTOR_MINER_CSV_RESUME=1 时已存在的 CSV 直接复用，不再重复抓取。"""
+    prov = make_provider(tmp_path)
+    csv_dir = tmp_path / "csv_resume"
+    csv_dir.mkdir()
+    # 上一轮已抓好的 600519（新日历 08-26/08-27 两行）。
+    # 口径与真实抓取路径一致：close = qfq × 复权连续因子，factor = qfq/raw。
+    q = 1297.4 * 0.2432
+    (csv_dir / "sh600519.csv").write_text(
+        "date,open,high,low,close,volume,factor\n"
+        "2026-08-26,%.4f,%.4f,%.4f,%.4f,1000.0,0.2432\n"
+        "2026-08-27,%.4f,%.4f,%.4f,%.4f,1000.0,0.2432\n" % ((q,) * 4 + (q,) * 4))
+    monkeypatch.setenv("FACTOR_MINER_CSV_DIR", str(csv_dir))
+    monkeypatch.setenv("FACTOR_MINER_CSV_RESUME", "1")
+
+    fetched = []
+    base = _normal_fetcher()
+
+    class TrackingFetcher(FakeFetcher):
+        def fetch_stock(self, code, start, end):
+            fetched.append(code)
+            if code == "600519":
+                raise AssertionError("已复用的票不该再被抓取")
+            return base.fetch_stock(code, start, end)
+
+    rc = ud.run(str(prov), str(tmp_path / "mining"),
+                fetcher=TrackingFetcher(base.index_days, base.data),
+                symbols=["600519", "000001"], skip_h5=True)
+    assert rc == ud.EXIT_OK
+    assert fetched == ["000001"], "只该抓缺失的票"
+    # 复用的 CSV 必须真的进了库：600519 的 close 有 4 行（含新两天）
+    close = _read_bin(prov / "features" / "sh600519" / "close.day.bin")
+    assert len(close) == 5 and close[-1] == pytest.approx(q, rel=1e-4)
+
+
+def test_resume_off_ignores_existing_csv(tmp_path):
+    """不开 resume 时沿用临时目录：同名 CSV 不会被复用（避免静默用旧数据）。"""
+    prov = make_provider(tmp_path)
+    csv_dir = tmp_path / "csv_resume"
+    csv_dir.mkdir()
+    (csv_dir / "sh600519.csv").write_text(
+        "date,open,high,low,close,volume,factor\n"
+        "2026-08-26,1.0,1.0,1.0,1.0,1.0,1.0\n")
+    rc = ud.run(str(prov), str(tmp_path / "mining"), fetcher=_normal_fetcher(),
+                symbols=["600519", "000001"], skip_h5=True)
+    assert rc == ud.EXIT_OK
+    close = _read_bin(prov / "features" / "sh600519" / "close.day.bin")
+    # 真实抓取口径：close = qfq × 连续因子 = 1297.4 × 0.2432
+    assert close[-1] == pytest.approx(1297.4 * 0.2432, rel=1e-4), \
+        "应走真实抓取，而非那个 1.0 的旧 CSV"
