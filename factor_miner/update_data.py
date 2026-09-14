@@ -415,6 +415,24 @@ def copy_to_staging(provider_dir: Path, staging: Path):
     shutil.copytree(provider_dir, staging)
 
 
+def feature_instruments(staging: Path) -> dict:
+    """{6 位代码: features 目录名}——直接用数据集里真实存在的目录反查。
+
+    不要用 market_of 去"猜"市场：它只会返回 sh/sz（按首位 6/9 判沪深），
+    而数据集里还有 `bj836414` 这类北交所目录。抽样抽到北交所票时，
+    猜出来的 `sz836414` 必然不存在 → 校验误报"close.day.bin 缺失"，
+    把一次本来正确的落库拦下来（2026-09-14 实际发生过）。
+    """
+    out = {}
+    try:
+        for d in (staging / "features").iterdir():
+            if d.is_dir() and len(d.name) > 6:
+                out[d.name[-6:].upper()] = d.name
+    except OSError as e:
+        log.warning("features 目录读取失败: %s", e)
+    return out
+
+
 def validate_staging(staging: Path, expected_last_day: str, min_instruments: int, sample_codes: list):
     """校验 staging 副本。任何一项不过抛 ValidateError。"""
     cal = read_calendar(staging)
@@ -424,10 +442,11 @@ def validate_staging(staging: Path, expected_last_day: str, min_instruments: int
     n_inst = sum(1 for _ in open(staging / "instruments" / "all.txt"))
     if n_inst < min_instruments:
         raise ValidateError(f"instruments 回退: {n_inst} < {min_instruments}")
+    dirs = feature_instruments(staging)
     for code in sample_codes:
-        fname = (market_of(code) + code).lower()
-        bin_path = staging / "features" / fname / "close.day.bin"
-        if not bin_path.exists():
+        name = dirs.get(str(code)[-6:].upper())
+        bin_path = staging / "features" / name / "close.day.bin" if name else None
+        if not name or not bin_path.exists():
             raise ValidateError(f"{code} close.day.bin 缺失")
         arr = np.fromfile(bin_path, dtype="<f")
         want = len(cal) - int(arr[0])
@@ -770,11 +789,12 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
         dumper.dump()
 
         # 4. 校验
-        # 抽样要覆盖"刚更新的"和"存量里随机的"两面：只抽刚更新的几只时，
+        # 抽样要覆盖"刚更新的"和"数据集里随机的"两面：只抽刚更新的几只时，
         # 一旦只有少数票更新成功（局部落库），校验反而会因为抽到这几只而通过。
-        # old_end 的键是 SH600000 形式，这里剥掉市场前缀还原成 validate 要的 6 位码。
-        pool = sorted({k[2:] for k in old_end} | set(updated) | set(new_syms))
-        sample = random.sample(pool, min(30, len(pool))) if pool else []
+        # 池子取自**数据集里真实存在的标的**（而不是 all.txt）：all.txt 的条目未必
+        # 都有 features 目录，抽到那种条目只会误报"bin 缺失"。
+        pool = sorted(set(feature_instruments(staging)) | {str(c).upper() for c in updated + new_syms})
+        sample = sorted(set(random.sample(pool, min(30, len(pool)))) | set(updated[:3]) | set(new_syms[:2])) if pool else []
         latest_day = new_days[-1] if new_days else calendar[-1].strftime("%Y-%m-%d")
         try:
             validate_staging(staging, latest_day, len(old_end), sample)

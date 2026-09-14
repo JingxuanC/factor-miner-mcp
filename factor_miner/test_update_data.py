@@ -438,3 +438,32 @@ def test_resume_off_ignores_existing_csv(tmp_path):
     # 真实抓取口径：close = qfq × 连续因子 = 1297.4 × 0.2432
     assert close[-1] == pytest.approx(1297.4 * 0.2432, rel=1e-4), \
         "应走真实抓取，而非那个 1.0 的旧 CSV"
+
+
+# ═══════════ 回归: 抽样不能"猜"市场（北交所目录名是 bj，不是 sz）═══════════
+
+def test_validate_handles_bj_instrument_sample(tmp_path):
+    """样本里含北交所票时不能误报缺失——market_of 只会给 sh/sz，必须用真实目录反查。"""
+    prov = make_provider(tmp_path)
+    (prov / "instruments" / "all.txt").write_text(
+        "SH600519\t2020-01-02\t2026-08-25\n"
+        "SZ000001\t2020-01-02\t2026-08-25\n"
+        "BJ836414\t2020-01-02\t2026-08-25\n")
+    for fname in ("sh600519", "sz000001", "bj836414"):
+        _write_bin(prov / "features" / fname / "close.day.bin", 0, [1.0, 2.0])
+    dirs = ud.feature_instruments(prov)
+    assert dirs["836414"] == "bj836414", "必须能用代码反查到北交所目录"
+    # 旧逻辑会算出 sz836414 → 误报缺失把落库拦下来
+    ud.validate_staging(prov, "2026-08-25", 3, ["836414", "600519", "000001"])
+
+
+def test_validate_reports_real_missing_bin(tmp_path):
+    """真缺失时必须照旧拦截（不能为了修误报而放水）。"""
+    prov = make_provider(tmp_path)
+    (prov / "instruments" / "all.txt").write_text(
+        "SH600519\t2020-01-02\t2026-08-25\nSZ000001\t2020-01-02\t2026-08-25\n")
+    for fname in ("sh600519", "sz000001"):
+        _write_bin(prov / "features" / fname / "close.day.bin", 0, [1.0, 2.0])
+    # 数据集里没有的代码（模拟 all.txt 有条目但目录缺失）
+    with pytest.raises(ud.ValidateError, match="close.day.bin 缺失"):
+        ud.validate_staging(prov, "2026-08-25", 2, ["600519", "836414"])
