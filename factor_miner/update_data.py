@@ -694,6 +694,10 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
     updated, new_syms, failed, last_day_hits = [], [], 0, 0
     try:
         for i, code in enumerate(symbols):
+            # 进度日志放在循环顶部：复用分支会 continue，放在底部就看不到复用阶段的进度
+            if (i + 1) % 500 == 0:
+                log.info("抓取进度 %d/%d, 更新 %d, 复用 %d, 失败 %d",
+                         i + 1, len(symbols), len(updated) + len(new_syms), reused, failed)
             fname = (market_of(code) + code).upper()
             is_new = fname not in old_end
             csv_path = csv_dir / f"{market_of(code)}{code}.csv"
@@ -740,8 +744,6 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
             rows_out["date"] = rows_out["date"].dt.strftime("%Y-%m-%d")
             rows_out.to_csv(csv_dir / f"{market_of(code)}{code}.csv", index=False)
             (new_syms if is_new else updated).append(code)
-            if (i + 1) % 500 == 0:
-                log.info("抓取进度 %d/%d, 更新 %d, 失败 %d", i + 1, len(symbols), len(updated), failed)
 
         if not updated and not new_syms:
             log.error("没有任何股票更新成功（大面积失败）")
