@@ -706,6 +706,7 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
     # 抓 5000+ 只票走的是免费源（约 1 只/秒，一跑 1.5 小时），中断后从头再来
     # 代价极高——而中断（进程被杀/容器重启）并不会损坏 provider 目录，
     # 因为落库是最后一步的原子 swap。这个开关让那一小时的抓取不白费。
+    csv_dir_from_env = bool(os.environ.get("FACTOR_MINER_CSV_DIR"))
     csv_dir = Path(os.environ.get("FACTOR_MINER_CSV_DIR") or tempfile.mkdtemp(prefix="qlib_csv_"))
     csv_dir.mkdir(parents=True, exist_ok=True)
     resume = os.environ.get("FACTOR_MINER_CSV_RESUME") == "1"
@@ -807,7 +808,15 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
         atomic_swap(provider_dir, staging, prev)
         log.info("cn_data 已切换到新版本（最新交易日 %s）", latest_day)
     finally:
-        shutil.rmtree(csv_dir, ignore_errors=True)
+        # 抓取目录是本次最贵的产物（5553 只票约 1.5 小时，走免费源约 1 只/秒）。
+        # 只清理**自己创建的临时目录**；调用方通过 FACTOR_MINER_CSV_DIR 显式给的
+        # 目录由调用方管生命周期——否则"校验失败"这种正常退出会把已抓好的数据
+        # 一起删掉，续抓就成了摆设（2026-09-14 因此白跑两次全量）。
+        if csv_dir_from_env:
+            log.info("保留调用方指定的抓取目录: %s（复用 %d 只，续跑请带 FACTOR_MINER_CSV_RESUME=1）",
+                     csv_dir, reused)
+        else:
+            shutil.rmtree(csv_dir, ignore_errors=True)
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
 

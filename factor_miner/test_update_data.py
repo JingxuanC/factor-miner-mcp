@@ -467,3 +467,30 @@ def test_validate_reports_real_missing_bin(tmp_path):
     # 数据集里没有的代码（模拟 all.txt 有条目但目录缺失）
     with pytest.raises(ud.ValidateError, match="close.day.bin 缺失"):
         ud.validate_staging(prov, "2026-08-25", 2, ["600519", "836414"])
+
+
+def test_explicit_csv_dir_survives_normal_exit(tmp_path, monkeypatch):
+    """调用方显式给的抓取目录不能在正常退出时被清掉（否则校验失败会白丢一次全量抓取）。"""
+    prov = make_provider(tmp_path)
+    csv_dir = tmp_path / "csv_keep"
+    csv_dir.mkdir()
+    monkeypatch.setenv("FACTOR_MINER_CSV_DIR", str(csv_dir))
+    rc = ud.run(str(prov), str(tmp_path / "mining"), fetcher=_normal_fetcher(),
+                symbols=["000001", "600519"], skip_h5=True)
+    assert rc == ud.EXIT_OK
+    kept = sorted(p.name for p in csv_dir.glob("*.csv"))
+    assert kept == ["sh600519.csv", "sz000001.csv"], "显式给的目录必须留着"
+
+
+def test_explicit_csv_dir_survives_validation_failure(tmp_path, monkeypatch):
+    """校验失败这条路径更要留：已抓好的 CSV 是重试的唯一本钱。"""
+    prov = make_provider(tmp_path)
+    csv_dir = tmp_path / "csv_keep"
+    csv_dir.mkdir()
+    monkeypatch.setenv("FACTOR_MINER_CSV_DIR", str(csv_dir))
+    monkeypatch.setattr(ud, "MIN_BIN_COVERAGE", 1.01)  # 强制覆盖面校验失败
+    rc = ud.run(str(prov), str(tmp_path / "mining"), fetcher=_normal_fetcher(),
+                symbols=["000001", "600519"], skip_h5=True)
+    assert rc == ud.EXIT_VALIDATE
+    assert sorted(p.name for p in csv_dir.glob("*.csv")) == ["sh600519.csv", "sz000001.csv"]
+    assert ud.read_calendar(prov)[-1] == pd.Timestamp("2026-08-25"), "旧数据必须保留"
