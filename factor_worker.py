@@ -60,6 +60,21 @@ DFACTOR_PREFIX = "dfactor:"        # live 因子日频 Redis 前缀（区别于�
 DFACTOR_TTL = 48 * 3600            # 日频 cadence：48h
 RECENT_IC_LOOKBACK = 60            # 周日衰减巡检默认回看交易日数
 
+# 沙箱输入窗口：只把最近 N 个交易日喂进沙箱（0 = 全量，保持旧行为）。
+#
+# 为什么必须截：沙箱 RLIMIT_AS=2GB（sandbox.MAX_AS_BYTES），而全量
+# daily_pv_all.h5 是 6000+ 标的 × 4300+ 交易日（实测 15,095,115 行 × 6 列）。
+# 因子代码 `pd.read_hdf('daily_pv.h5')` 把它读成 numpy 时虚拟地址空间直接爆掉：
+#   numpy._core._exceptions._ArrayMemoryError: Unable to allocate 345. MiB
+# 而两个调用方其实都用不到全量历史 —— factor_recent_ic 只取尾部 lookback_days 天、
+# factor_daily_compute 只取最新截面 —— 截窗不改变结果，却把沙箱内存降一个数量级，
+# 顺带把单次执行从"算 4300 天"降到"算 400 天"。
+#
+# 400 个交易日（约 1.6 年）覆盖绝大多数公开因子（20 日反转、60/250 日动量、
+# 1 年波动率等）。需要更长历史的因子把 FACTOR_MINER_WINDOW_DAYS 调大，
+# 必要时同时调大 FACTOR_MINER_MAX_AS_BYTES。
+WINDOW_DAYS = int(os.environ.get("FACTOR_MINER_WINDOW_DAYS", "400") or 0)
+
 # Redis 客户端（模块内自持，不 import server.py；测试可 monkeypatch _get_redis）
 _REDIS = None
 _REDIS_FAILED_AT = 0.0
@@ -225,7 +240,9 @@ def factor_execute(code: str, debug: bool = True) -> str:
     job_dir = JOBS_ROOT / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
     # factor.py 契约：读同目录 daily_pv.h5，写 result.h5
-    (job_dir / "daily_pv.h5").symlink_to(data_h5.resolve())
+    # debug 数据集很小（100 股 × 2 年），保持 symlink；全量则按窗口截取，
+    # 否则 15M 行会撑爆沙箱 RLIMIT_AS（见 WINDOW_DAYS 说明）。
+    stage_h5_for_sandbox(data_h5, job_dir, 0 if debug else WINDOW_DAYS)
 
     res = sandbox.run_factor_source(code, str(job_dir), timeout=EXEC_TIMEOUT)
     if res.violation:
@@ -243,6 +260,9 @@ def factor_execute(code: str, debug: bool = True) -> str:
         "stdout": res.stdout,
         "eval_ok": eval_res.ok,
         "eval_detail": eval_res.feedback(),
+        # 明示评估窗口：全量执行时只喂了最近 WINDOW_DAYS 个交易日（不静默改语义）
+        "window_days": 0 if debug else WINDOW_DAYS,
+        "dataset": "debug" if debug else "full",
     })
 
 
@@ -408,11 +428,43 @@ def factor_backtest(sota: list, new_factors: list, profile: str = "full",
 # ═══════════════════════════════════════════════════════════════
 
 
-def _run_factor_df(code: str, data_h5: Path) -> pd.DataFrame:
-    """沙箱执行单个 factor.py 并读回 (datetime, instrument) 归一化 DataFrame。"""
+def stage_h5_for_sandbox(data_h5: Path, job_dir: Path, window_days: int) -> Path:
+    """把 h5 按窗口截取后放进 job 目录，返回沙箱要读的路径。
+
+    window_days <= 0 → 旧的 symlink 全量行为（联调/需要全历史时用）。
+    窗口是"最近 N 个交易日"，索引层级名沿用原文件的 ``datetime`` / ``instrument``，
+    HDF key 保持 ``data``（因子代码惯用 ``pd.read_hdf('daily_pv.h5')`` 单 key 读取）。
+    """
+    dst = job_dir / "daily_pv.h5"
+    if window_days <= 0:
+        dst.symlink_to(data_h5.resolve())
+        return dst
+
+    df = pd.read_hdf(data_h5, key="data")
+    try:
+        dts = df.index.get_level_values("datetime").unique().sort_values()
+    except (KeyError, AttributeError):
+        # 索引层级名不是预期结构：原样落盘，不做窗口（安全兜底）
+        df.to_hdf(dst, key="data", mode="w")
+        return dst
+    if len(dts) > window_days:
+        keep = set(dts[-window_days:])
+        df = df[df.index.get_level_values("datetime").isin(keep)]
+    df.to_hdf(dst, key="data", mode="w")
+    return dst
+
+
+def _run_factor_df(code: str, data_h5: Path,
+                   window_days: int | None = None) -> pd.DataFrame:
+    """沙箱执行单个 factor.py 并读回 (datetime, instrument) 归一化 DataFrame。
+
+    ``window_days`` 缺省用 ``WINDOW_DAYS``（默认 400 交易日）；见该常量的说明 ——
+    全量 h5 会撑爆沙箱 RLIMIT_AS。
+    """
     job_dir = JOBS_ROOT / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
-    (job_dir / "daily_pv.h5").symlink_to(data_h5.resolve())
+    stage_h5_for_sandbox(data_h5, job_dir,
+                         WINDOW_DAYS if window_days is None else window_days)
     res = sandbox.run_factor_source(code, str(job_dir), timeout=EXEC_TIMEOUT)
     if res.violation:
         raise RuntimeError(f"whitelist violation: {res.violation}")

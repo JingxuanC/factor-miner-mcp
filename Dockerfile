@@ -23,7 +23,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
+# 国内构建加速（本地部署适配）：容器内 Debian 官方源被污染，统一换阿里云镜像
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g; s|http://security.debian.org|http://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 sudo \
     && rm -rf /var/lib/apt/lists/*
 

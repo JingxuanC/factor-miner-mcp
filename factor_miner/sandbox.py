@@ -32,7 +32,11 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
-MAX_AS_BYTES = 2 * 1024 * 1024 * 1024  # 2GB 地址空间（宿主机 3.7G 内存，留余量）
+# RLIMIT_AS：地址空间硬上限。注意这是**虚拟地址空间**（含 mmap），不是 RSS ——
+# pandas/pytables 读一张宽表时 VA 远高于实际驻留内存。默认 2GB 对"按窗口截取后的
+# 数据"足够（见 factor_worker.WINDOW_DAYS）；若确需喂全量历史，把
+# FACTOR_MINER_MAX_AS_BYTES 调大（宿主 7.3G，留足余量再调）。
+MAX_AS_BYTES = int(os.environ.get("FACTOR_MINER_MAX_AS_BYTES", 2 * 1024 * 1024 * 1024))
 MAX_CPU_SECONDS = 300
 DEFAULT_TIMEOUT_SECONDS = 120
 # RLIMIT_FSIZE：单文件最大字节。4GB 远高于 result.h5 实际体量，只为挡"写爆磁盘"

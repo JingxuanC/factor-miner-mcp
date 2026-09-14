@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from .factor_eval import evaluate
 
@@ -97,3 +98,86 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(main())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 沙箱输入截窗（factor_worker.stage_h5_for_sandbox）
+#
+# 背景：全量 daily_pv_all.h5 是 6000+ 标的 × 4300+ 交易日（实测 15,095,115 行），
+# 因子代码 read_hdf 读它会在沙箱 RLIMIT_AS=2GB 下炸：
+#   numpy._core._exceptions._ArrayMemoryError: Unable to allocate 345. MiB
+# 而 recent_ic / daily_compute 都只用尾部窗口 —— 截窗必须"结果不变"。
+# ═══════════════════════════════════════════════════════════════════
+
+def _mk_pv(n_days: int, n_inst: int = 3) -> "pd.DataFrame":
+    import numpy as np
+    import pandas as pd
+    dts = pd.date_range("2024-01-01", periods=n_days, freq="B")
+    insts = ["sh60000%d" % i for i in range(n_inst)]
+    idx = pd.MultiIndex.from_product([dts, insts], names=["datetime", "instrument"])
+    return pd.DataFrame({
+        "$close": np.arange(len(idx), dtype="float64"),
+        "$open": np.arange(len(idx), dtype="float64"),
+        "$high": np.arange(len(idx), dtype="float64") + 1,
+        "$low": np.arange(len(idx), dtype="float64") - 1,
+        "$volume": np.ones(len(idx)),
+        "$factor": np.ones(len(idx)),
+    }, index=idx)
+
+
+def test_stage_h5_window_keeps_tail_only(tmp_path):
+    pytest.importorskip("tables")   # HDF5 依赖：未装则跳过，不误报
+    """截窗后只剩最近 N 天，且尾部数据逐值不变（IC/最新截面口径不变）。"""
+    import pandas as pd
+    from factor_worker import stage_h5_for_sandbox
+    src = tmp_path / "daily_pv_all.h5"
+    df = _mk_pv(100)
+    df.to_hdf(src, key="data", mode="w")
+
+    job = tmp_path / "job"
+    job.mkdir()
+    out = stage_h5_for_sandbox(src, job, window_days=30)
+
+    staged = pd.read_hdf(out, key="data")
+    assert staged.index.get_level_values("datetime").nunique() == 30
+    # 尾部 30 天必须与原数据逐值一致
+    tail = df.loc[df.index.get_level_values("datetime").isin(
+        df.index.get_level_values("datetime").unique().sort_values()[-30:])]
+    pd.testing.assert_frame_equal(staged.sort_index(), tail.sort_index())
+    # key / 层级名 / 列名保持（因子代码惯用单 key 读取 + level="instrument"）
+    assert list(staged.columns) == list(df.columns)
+    assert staged.index.names == ["datetime", "instrument"]
+
+
+def test_stage_h5_window_larger_than_data_is_noop(tmp_path):
+    pytest.importorskip("tables")   # HDF5 依赖：未装则跳过，不误报
+    from factor_worker import stage_h5_for_sandbox
+    src = tmp_path / "daily_pv_all.h5"
+    df = _mk_pv(10)
+    df.to_hdf(src, key="data", mode="w")
+    job = tmp_path / "job"
+    job.mkdir()
+    out = stage_h5_for_sandbox(src, job, window_days=400)
+    import pandas as pd
+    pd.testing.assert_frame_equal(pd.read_hdf(out, key="data").sort_index(),
+                                  df.sort_index())
+
+
+def test_stage_h5_window_zero_keeps_symlink(tmp_path):
+    pytest.importorskip("tables")   # HDF5 依赖：未装则跳过，不误报
+    """window_days<=0 保持旧的 symlink 全量行为（需要全历史时用）。"""
+    from factor_worker import stage_h5_for_sandbox
+    src = tmp_path / "daily_pv_all.h5"
+    _mk_pv(5).to_hdf(src, key="data", mode="w")
+    job = tmp_path / "job"
+    job.mkdir()
+    out = stage_h5_for_sandbox(src, job, window_days=0)
+    assert out.is_symlink()
+    assert out.resolve() == src.resolve()
+
+
+def test_window_days_default_is_bounded():
+    """默认窗口必须是有界的（否则又会把全量喂进 2GB 沙箱）。"""
+    import factor_worker as fw
+    assert fw.WINDOW_DAYS > 0
+    assert fw.WINDOW_DAYS <= 1000
