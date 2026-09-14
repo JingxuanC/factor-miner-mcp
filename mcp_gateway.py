@@ -267,21 +267,102 @@ class QueueFull(Exception):
     """队列已满，客户端应稍后重试。"""
 
 
+# 匿名（无 license key 的开放模式）单飞标识：空 key 也必须互斥
+_ANON_OWNER = "<anonymous>"
+# handler 级超时默认值（env MCP_JOB_TIMEOUT_SEC 覆盖；<=0 = 不超时）
+DEFAULT_HANDLER_TIMEOUT_SEC = int(os.environ.get("MCP_JOB_TIMEOUT_SEC", "3600"))
+
+
+def _first_text(payload: dict) -> str:
+    for k in ("message", "detail", "error", "eval_detail", "traceback"):
+        v = payload.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:2000]
+    return ""
+
+
+def classify_job_result(result) -> tuple[bool, str]:
+    """把 handler 返回值判定为 (ok, error_text)。
+
+    handler 约定「永不抛异常、失败也返回 JSON」，所以必须从返回值识别失败：
+    非空 error / ok is False / status == "error" / exit_code != 0 → 失败。
+    刻意**不**把 factor_execute 的 eval_ok=False 当任务失败（那是工具的正常负
+    结论，旧行为即 done）；保持成功路径行为不变，只有失败语义被显式暴露出来。
+    """
+    payload = result
+    if isinstance(result, (str, bytes)):
+        try:
+            payload = json.loads(result)
+        except (ValueError, TypeError):
+            return True, ""
+    if not isinstance(payload, dict):
+        return True, ""
+    err = payload.get("error")
+    if err:
+        return False, err.strip() if isinstance(err, str) else str(err)
+    if payload.get("ok") is False:
+        return False, _first_text(payload) or "handler returned ok=false"
+    status = payload.get("status")
+    if isinstance(status, str) and status.lower() == "error":
+        return False, _first_text(payload) or "handler returned status=error"
+    code = payload.get("exit_code")
+    if isinstance(code, (int, float)) and not isinstance(code, bool) and code != 0:
+        return False, _first_text(payload) or f"handler returned exit_code={code}"
+    return True, ""
+
+
+def _call_with_timeout(fn, kwargs: dict, timeout_sec: float):
+    """在守护线程里跑 handler；超时返回 (None, "timeout after Ns")。
+
+    超时**不强杀**（Python 无法安全 kill 线程/线程内 C 调用）：只把 job 标记成
+    error，执行线程作为守护线程继续跑到自然结束，返回值被丢弃。这满足"状态可见、
+    不泄漏新进程"，同时避免主 worker 线程被永久占用。
+    """
+    if not timeout_sec or timeout_sec <= 0:
+        return fn(**kwargs), None
+    box: dict = {}
+    done = threading.Event()
+
+    def _target():
+        try:
+            box["result"] = fn(**kwargs)
+        except BaseException as e:  # noqa: BLE001 — 交给调用方记 error
+            box["exc"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=_target, daemon=True, name="job-handler").start()
+    if not done.wait(timeout_sec):
+        return None, f"timeout after {int(timeout_sec)}s"
+    if "exc" in box:
+        raise box["exc"]
+    return box["result"], None
+
+
 class JobQueue:
     """有界队列 + 固定 worker 线程池执行重负载工具。
 
     - 队列满 → 提交即拒（QueueFull），不让请求堆积
     - 结果保留 ttl_sec 供轮询，过期清掉
-    - 每 key 同时只允许 1 个重任务在跑/排队（防单用户霸占总线）
+    - 每 owner 同时只允许 1 个重任务在跑/排队（防单用户霸占总线）；
+      owner = license key，开放模式（key=""）退化为匿名全局单飞
+    - handler 级超时（默认 3600s，env MCP_JOB_TIMEOUT_SEC 或 tool 级
+      MCP_JOB_TIMEOUT_<TOOL> 覆盖）：超时 → status="error" + error="timeout after Ns"
+    - handler 返回值含失败语义（error/ok=false/status=error/exit_code!=0）时
+      → status="error"（原实现无条件 done，失败被吞）
     """
 
     def __init__(self, handlers: dict, workers: int = 2, maxsize: int = 50,
-                 ttl_sec: int = 3600):
+                 ttl_sec: int = 3600, handler_timeout_sec: "int | None" = None,
+                 handler_timeouts: dict = None):
         self._handlers = handlers
         self._q: queue.Queue[str] = queue.Queue(maxsize=maxsize)
         self._jobs: dict[str, dict] = {}
         self._jobs_total = {"done": 0, "error": 0}  # 累计完成数（给 /metrics）
         self._ttl = ttl_sec
+        self._handler_timeout = (DEFAULT_HANDLER_TIMEOUT_SEC
+                                 if handler_timeout_sec is None else handler_timeout_sec)
+        self._handler_timeouts = dict(handler_timeouts or {})
         self._mu = threading.Lock()
         self._stop = threading.Event()
         self._threads = [
@@ -292,16 +373,33 @@ class JobQueue:
             t.start()
         threading.Thread(target=self._reaper, daemon=True, name="jobreaper").start()
 
+    def _timeout_for(self, tool: str) -> float:
+        """tool 级超时优先级：显式 handler_timeouts > env MCP_JOB_TIMEOUT_<TOOL> > 默认。"""
+        if tool in self._handler_timeouts:
+            return float(self._handler_timeouts[tool])
+        env = os.environ.get(f"MCP_JOB_TIMEOUT_{tool.upper()}")
+        if env:
+            try:
+                return float(env)
+            except ValueError:
+                pass
+        return self._handler_timeout
+
     def submit(self, tool: str, args: dict, key: str = "") -> str:
-        # 单 key 并发闸：已有 queued/running 的重任务 → 拒绝
+        # 单 owner 并发闸：已有 queued/running 的重任务 → 拒绝。
+        # owner = license key；key="" 的开放模式退化为 _ANON_OWNER 全局单飞
+        # （旧实现 `if j["key"] == key and key` 在 key="" 时闸门完全失效）。
+        owner = key or _ANON_OWNER
         with self._mu:
             for j in self._jobs.values():
-                if j["key"] == key and key and j["status"] in ("queued", "running"):
+                if j.get("owner", j["key"] or _ANON_OWNER) == owner \
+                        and j["status"] in ("queued", "running"):
                     raise QueueFull("你已有一个重任务在执行/排队中，等它跑完再提交")
         job_id = uuid.uuid4().hex[:12]
         with self._mu:
             self._jobs[job_id] = {
-                "id": job_id, "tool": tool, "key": key, "status": "queued",
+                "id": job_id, "tool": tool, "key": key, "owner": owner,
+                "status": "queued",
                 "created_at": time.time(), "finished_at": None,
                 "result": None, "error": None,
             }
@@ -331,7 +429,8 @@ class JobQueue:
             for j in self._jobs.values():
                 by_status[j["status"]] = by_status.get(j["status"], 0) + 1
         return {"workers": len(self._threads), "queue_size": self._q.qsize(),
-                "jobs": by_status, "jobs_total": dict(self._jobs_total)}
+                "jobs": by_status, "jobs_total": dict(self._jobs_total),
+                "handler_timeout_sec": self._handler_timeout}
 
     def _worker(self):
         while not self._stop.is_set():
@@ -339,26 +438,44 @@ class JobQueue:
                 job_id, tool, args = self._q.get(timeout=1)
             except queue.Empty:
                 continue
-            with self._mu:
-                if job_id not in self._jobs:
-                    continue
-                self._jobs[job_id]["status"] = "running"
-                created_at = self._jobs[job_id]["created_at"]
             try:
-                result = self._handlers[tool](**args)
                 with self._mu:
-                    self._jobs[job_id].update(status="done", result=str(result),
-                                              finished_at=time.time())
-                    self._jobs_total["done"] += 1
-                METRICS.inc_call(tool, "ok")
-                METRICS.observe_latency(tool, time.time() - created_at)
-            except Exception as e:  # noqa: BLE001
-                logger.error("job %s (%s) failed: %s", job_id, tool, e)
+                    if job_id not in self._jobs:
+                        continue
+                    self._jobs[job_id]["status"] = "running"
+                    created_at = self._jobs[job_id]["created_at"]
+                result_text, error_text = None, ""
+                try:
+                    result, timeout_err = _call_with_timeout(
+                        self._handlers[tool], args, self._timeout_for(tool))
+                    if timeout_err:
+                        error_text = timeout_err
+                        logger.error("job %s (%s) %s — marked error; handler "
+                                     "thread left running (not killable)",
+                                     job_id, tool, timeout_err)
+                    else:
+                        ok, error_text = classify_job_result(result)
+                        result_text = str(result)
+                        if not ok:
+                            logger.error("job %s (%s) handler reported failure: %s",
+                                         job_id, tool, error_text[:500])
+                except Exception as e:  # noqa: BLE001 — handler 抛异常同样记 error
+                    error_text = str(e)
+                    logger.error("job %s (%s) raised: %s", job_id, tool, e)
+                ok = not error_text
                 with self._mu:
-                    self._jobs[job_id].update(status="error", error=str(e),
-                                              finished_at=time.time())
-                    self._jobs_total["error"] += 1
-                METRICS.inc_call(tool, "error")
+                    if job_id in self._jobs:
+                        if ok:
+                            self._jobs[job_id].update(
+                                status="done", result=result_text, error=None,
+                                finished_at=time.time())
+                        else:
+                            # 失败：保留 result 原文（调用方仍能拿到 payload）+ 写 error
+                            self._jobs[job_id].update(
+                                status="error", error=error_text,
+                                result=result_text, finished_at=time.time())
+                        self._jobs_total["done" if ok else "error"] += 1
+                METRICS.inc_call(tool, "ok" if ok else "error")
                 METRICS.observe_latency(tool, time.time() - created_at)
             finally:
                 self._q.task_done()

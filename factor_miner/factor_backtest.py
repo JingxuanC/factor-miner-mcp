@@ -137,13 +137,42 @@ class BacktestResult:
         }
 
 
+MANIFEST_NAME = "manifest.json"
+
+
+def _manifest_version(data_h5: Path) -> str:
+    """manifest.json 的 h5_sha256（update_data 落地）→ 版本串；不可信时返回 ""。
+
+    可信条件：manifest 存在且 **mtime >= h5 mtime**。若 h5 在 manifest 之后被
+    重建（如直接跑 gen_data），manifest 里的 sha 已过期，退回 mtime+size。
+    """
+    try:
+        data_h5 = Path(data_h5)
+        mf = data_h5.parent / MANIFEST_NAME
+        if not mf.exists():
+            return ""
+        if mf.stat().st_mtime < data_h5.stat().st_mtime:
+            return ""
+        info = json.loads(mf.read_text())
+        sha = str(info.get("h5_sha256") or "")
+        return f"sha256:{sha}" if len(sha) >= 32 else ""
+    except Exception:  # noqa: BLE001 — manifest 坏/不可读按无 manifest 处理
+        return ""
+
+
 def data_version(data_h5: Path) -> str:
-    """数据版本 = 文件内容 md5（流式，全量 h5 也不占内存）。"""
-    h = hashlib.md5()
-    with open(data_h5, "rb") as f:
-        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    """exec_cache 的数据版本：manifest sha256 优先，退化 mtime+size。
+
+    旧实现对整份 h5 做 md5（全量 h5 每次回测全文件 hash，且同一回测算两次）；
+    新实现 O(1) 只读元数据，且 h5 同内容重生成时版本不变（sha256 相同）→ 缓存
+    不会因"每日重建但数据没变"而整体失效。docs: cache_key() 的调用方契约不变。
+    """
+    data_h5 = Path(data_h5)
+    v = _manifest_version(data_h5)
+    if v:
+        return v
+    st = data_h5.stat()
+    return f"mtime:{st.st_mtime_ns}:size:{st.st_size}"
 
 
 def cache_key(code: str, version: str) -> str:
@@ -335,15 +364,20 @@ def run_backtest(
     profile: str = "full",
     factor_timeout: int = sandbox.DEFAULT_TIMEOUT_SECONDS,
     n_proc: int = 4,
+    version: "str | None" = None,
 ) -> BacktestResult:
-    """跑一轮 qlib 回测。失败语义见模块 docstring。"""
+    """跑一轮 qlib 回测。失败语义见模块 docstring。
+
+    version：exec_cache 的数据版本；调用方（factor_worker）已算过就传进来，
+    避免同一回测把数据版本算两次（旧版这里会重复 hash 整份 h5）。
+    """
     work_dir = Path(work_dir)
     data_h5 = Path(data_h5)
     factors_dir = work_dir / "factors"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Step 1: 进程池重执行（逐因子 exec_cache 命中则跳过）──
-    version = data_version(data_h5)
+    version = version or data_version(data_h5)
     all_factors = [("sota", f) for f in sota_factors] + [("new", new_factor)]
     dfs: dict[str, pd.DataFrame] = {}
     misses: list[tuple[str, FactorSrc]] = []
@@ -418,6 +452,9 @@ def run_backtest(
             capture_output=True,
             text=True,
             timeout=timeout,
+            # qrun 子进程同样上 rlimit（仅 RLIMIT_FSIZE，见 sandbox.qrun_preexec：
+            # RLIMIT_AS/CPU 会杀掉多线程全量回测，故不复用 _apply_limits）
+            preexec_fn=sandbox.qrun_preexec(),
         )
     except subprocess.TimeoutExpired as e:
         return BacktestResult(

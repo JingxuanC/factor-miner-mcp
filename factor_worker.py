@@ -17,8 +17,12 @@ P3 生产链路（§6 OOS 段 / §9 生产准入 / §12）：
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
+import tempfile
+import threading
+import time
 import traceback as tb_module
 import uuid
 from pathlib import Path
@@ -28,12 +32,24 @@ import pandas as pd
 from factor_miner import factor_backtest as fb
 from factor_miner import factor_eval, sandbox
 
+logger = logging.getLogger("factor-worker")
+
 # 数据目录可用 env 覆盖（联调/CI 指向合成数据）
 DATA_DIR = Path(os.environ.get("FACTOR_MINER_DATA_DIR", "data/factor_mining"))
 JOBS_ROOT = Path(os.environ.get("FACTOR_MINER_JOBS_DIR", "/tmp/factor_jobs"))
 BACKTEST_ROOT = Path(os.environ.get("FACTOR_MINER_BACKTEST_DIR", "/tmp/factor_backtests"))
 # 文件级执行缓存：md5(code + 数据版本) → result.h5 拷贝（§6 逐因子缓存）
 EXEC_CACHE_DIR = DATA_DIR / "exec_cache"
+
+# ── 磁盘清理（原实现 JOBS_ROOT/BACKTEST_ROOT/EXEC_CACHE 永不清理 → /tmp 积压）──
+CLEANUP_TTL_SEC = int(os.environ.get("FACTOR_MINER_CLEANUP_TTL_SEC", 24 * 3600))
+CLEANUP_INTERVAL_SEC = int(os.environ.get("FACTOR_MINER_CLEANUP_INTERVAL_SEC", 3600))
+EXEC_CACHE_MAX_ENTRIES = int(os.environ.get("FACTOR_MINER_EXEC_CACHE_MAX", 500))
+EXEC_CACHE_MAX_BYTES = int(os.environ.get("FACTOR_MINER_EXEC_CACHE_MAX_BYTES", 20 * 1024 ** 3))
+# 本项目在 /tmp 与数据目录里的中间产物前缀（中断残留；TTL 保护进行中的任务）
+_TMP_STALE_PREFIXES = ("qlib_csv_",)
+_DATA_STALE_PREFIXES = ("h5_",)
+_CLEANUP_STARTED = False
 
 EXEC_TIMEOUT = 120  # 沙箱墙壁时钟上限（§4）
 
@@ -75,6 +91,124 @@ def _get_redis():
 
 def _json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+# ═══════════════ 磁盘清理（TTL + exec_cache LRU） ═══════════════
+
+def cleanup_stale_dirs(root, ttl_sec: int = CLEANUP_TTL_SEC, now: float = None,
+                       prefixes: tuple = None) -> list:
+    """删掉 root 下 mtime 超过 ttl 的条目（目录/文件），返回被删路径。
+
+    prefixes 非空时只处理名字以上述前缀开头的条目（用于清理共享 /tmp 里的本项目残留）。
+    只按 mtime 判断、不递归；删除失败（权限/占用）跳过不抛。
+    """
+    root = Path(root)
+    if not root.exists():
+        return []
+    cutoff = (time.time() if now is None else now) - max(int(ttl_sec), 0)
+    removed: list = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return []
+    for p in entries:
+        if prefixes and not p.name.startswith(prefixes):
+            continue
+        try:
+            if p.stat().st_mtime >= cutoff:
+                continue
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink()
+            removed.append(str(p))
+        except OSError:
+            continue
+    return removed
+
+
+def cleanup_exec_cache(max_entries: int = EXEC_CACHE_MAX_ENTRIES,
+                       max_bytes: int = EXEC_CACHE_MAX_BYTES) -> list:
+    """exec_cache LRU：按 mtime 保留最新 max_entries 个，再把总量压到 max_bytes 内。"""
+    if not EXEC_CACHE_DIR.exists():
+        return []
+    entries = []
+    try:
+        for p in EXEC_CACHE_DIR.iterdir():
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, p))
+    except OSError:
+        return []
+    entries.sort(key=lambda x: x[0], reverse=True)  # 新 → 旧
+    keep_bytes, drop = 0, []
+    for i, (_mt, size, p) in enumerate(entries):
+        if i < max(int(max_entries), 0) and (max_bytes <= 0 or keep_bytes + size <= max_bytes):
+            keep_bytes += size
+        else:
+            drop.append(p)
+    removed: list = []
+    for p in drop:
+        try:
+            p.unlink()
+            removed.append(str(p))
+        except OSError:
+            continue
+    return removed
+
+
+def _cleanup_stale_staging(now: float = None) -> list:
+    """update_data 崩溃残留的 <provider>.__staging__ / .__prev__（TTL 保护进行中任务）。"""
+    uri = os.environ.get("QLIB_PROVIDER_URI")
+    if not uri:
+        return []
+    prov = Path(uri).expanduser()
+    removed: list = []
+    for name in (prov.name + ".__staging__", prov.name + ".__prev__"):
+        if (prov.parent / name).exists():
+            removed += cleanup_stale_dirs(prov.parent, now=now, prefixes=(name,))
+    return removed
+
+
+def cleanup_disk(now: float = None) -> dict:
+    """一次全量清理：job/回测目录（TTL）+ exec_cache（LRU）+ 中断残留。"""
+    out = {
+        "jobs": cleanup_stale_dirs(JOBS_ROOT, now=now),
+        "backtests": cleanup_stale_dirs(BACKTEST_ROOT, now=now),
+        "exec_cache": cleanup_exec_cache(),
+        "tmp": cleanup_stale_dirs(tempfile.gettempdir(), now=now,
+                                  prefixes=_TMP_STALE_PREFIXES),
+        "h5_tmp": cleanup_stale_dirs(DATA_DIR, now=now, prefixes=_DATA_STALE_PREFIXES),
+        "staging": _cleanup_stale_staging(now=now),
+    }
+    total = sum(len(v) for v in out.values())
+    if total:
+        logger.info("disk cleanup removed %d entries: %s", total,
+                    {k: len(v) for k, v in out.items() if v})
+    return out
+
+
+def start_cleanup_thread(interval_sec: int = CLEANUP_INTERVAL_SEC):
+    """起一个后台清理线程（幂等）。server.py 启动时调一次，之后每 interval 跑一次。"""
+    global _CLEANUP_STARTED
+    if _CLEANUP_STARTED:
+        return None
+    _CLEANUP_STARTED = True
+    interval = max(int(interval_sec), 60)
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                cleanup_disk()
+            except Exception as e:  # noqa: BLE001 — 清理失败不影响服务
+                logger.warning("disk cleanup failed: %s", e)
+
+    t = threading.Thread(target=_loop, daemon=True, name="factor-cleanup")
+    t.start()
+    return t
 
 
 def factor_execute(code: str, debug: bool = True) -> str:
@@ -218,6 +352,7 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
             conf_template=conf,
             exec_cache=exec_cache,
             profile=profile,
+            version=version,  # 复用本函数已算的数据版本，避免重复计算
         )
         _write_back_cache(sota_srcs + [new_src], version, work_dir)
         correlations[new_src.name] = _correlations(new_src, sota_srcs, version, work_dir)

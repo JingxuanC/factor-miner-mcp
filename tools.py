@@ -278,9 +278,16 @@ def update_data(source: str = "auto", limit: int = 0, skip_h5: bool = False, for
     out_dir = os.environ.get("FACTOR_MINER_DATA_DIR", "data/factor_mining")
     rc = _ud.run(provider_uri, out_dir, source=source, limit=limit or None,
                  skip_h5=skip_h5, force=force)
-    return json.dumps({"ok": rc == 0, "exit_code": rc,
-                       "provider_uri": provider_uri, "out_dir": out_dir},
-                      ensure_ascii=False)
+    payload = {"ok": rc == 0, "exit_code": rc,
+               "provider_uri": provider_uri, "out_dir": out_dir}
+    if rc != 0:
+        # 显式 error 字段：JobQueue 据此把 job 标成 status="error"（不再一律 done）
+        if rc == _ud.EXIT_LOCKED:
+            payload["error"] = "已有 update_data 任务在运行，本次提交被并发单飞锁拒绝"
+            payload["locked"] = True
+        else:
+            payload["error"] = f"update_data failed with exit_code={rc}"
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # compute_factors / predict 无 @tool schema，由 server 端硬编码补（见 server.py）

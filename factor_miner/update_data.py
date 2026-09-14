@@ -12,6 +12,8 @@
   8. manifest: 写 <out_dir>/manifest.json（含 h5 sha256）
 
 数据源全挂 / 大面积失败 / 校验不过 → 保留旧数据，退出码非 0。
+并发提交（第二个进程同时跑同一 provider）→ 文件锁立即拒绝（EXIT_LOCKED=5），
+避免两个流程同时 rmtree staging + atomic_swap 同一 provider_dir 造成数据损坏。
 
 用法:
   python3 -m factor_miner.update_data [--provider-uri ~/.qlib/qlib_data/cn_data]
@@ -34,6 +36,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    import fcntl
+except ImportError:  # Windows 无 fcntl → UpdateLock 退化为无锁（只记 warning）
+    fcntl = None
+
 from factor_miner.qlib_dump_bin import DumpDataUpdate
 
 log = logging.getLogger("update_data")
@@ -51,6 +58,7 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_NO_SOURCE = 3     # 数据源全挂 / 大面积失败
 EXIT_VALIDATE = 4      # 校验失败
+EXIT_LOCKED = 5        # 已有更新任务在跑（并发被单飞锁拒绝）
 
 
 class FetchError(Exception):
@@ -430,11 +438,108 @@ def write_manifest(out_dir: Path, info: dict):
     os.replace(tmp, out_dir / "manifest.json")
 
 
+# ═══════════════ 并发单飞锁 ═══════════════
+
+LOCK_ENV = "FACTOR_MINER_UPDATE_LOCK"
+
+
+def update_lock_path(provider_uri: str) -> Path:
+    """固定锁文件路径：env FACTOR_MINER_UPDATE_LOCK 覆盖，否则 /tmp 下按 provider 命名。"""
+    override = os.environ.get(LOCK_ENV)
+    if override:
+        return Path(override).expanduser()
+    key = hashlib.sha1(str(Path(provider_uri).expanduser()).encode()).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"factor_miner_update_{key}.lock"
+
+
+class UpdateLock:
+    """update_data 进程级单飞锁（fcntl.flock 独占 + 非阻塞）。
+
+    - 第二个并发提交立刻得到 False → 调用方返回 EXIT_LOCKED，**零副作用**
+      （不会 rmtree staging、不会 atomic_swap，避免两进程互相踩坏 provider_dir）
+    - 进程退出/崩溃由内核自动释放，不留死锁
+    - 无 fcntl 的平台（Windows）退化为无锁并 warning，不阻断服务
+    - flock 绑定 open file description，同进程第二次 open 也会被拒
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._fd = None
+
+    def acquire(self) -> bool:
+        if fcntl is None:
+            log.warning("fcntl 不可用，update_data 并发锁降级为无锁")
+            return True
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError as e:
+            log.warning("锁文件不可用 (%s)，降级为无锁: %s", self.path, e)
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._fd = fd
+        try:  # 记录持锁 pid，便于并发方排查
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()} {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
+        except OSError:
+            pass
+        return True
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self._fd)
+        finally:
+            self._fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def holder_pid(path) -> str:
+    """锁文件里记录的持有者（尽力而为，读不到返回空串）。"""
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
 # ═══════════════ 主流程 ═══════════════
 
 def run(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto",
         symbols: list = None, limit: int = None, skip_h5: bool = False,
         min_interval: float = 0.15, max_workers: int = 8, force: bool = False) -> int:
+    """带并发互斥的入口：已有更新在跑 → 立刻返回 EXIT_LOCKED（零副作用）。"""
+    lock = UpdateLock(update_lock_path(provider_uri))
+    if not lock.acquire():
+        log.error("已有 update_data 任务在运行（lock=%s holder=%s），拒绝并发提交",
+                  lock.path, holder_pid(lock.path))
+        return EXIT_LOCKED
+    try:
+        return _run_impl(provider_uri, out_dir, fetcher=fetcher, source=source,
+                         symbols=symbols, limit=limit, skip_h5=skip_h5,
+                         min_interval=min_interval, max_workers=max_workers,
+                         force=force)
+    finally:
+        lock.release()
+
+
+def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto",
+              symbols: list = None, limit: int = None, skip_h5: bool = False,
+              min_interval: float = 0.15, max_workers: int = 8, force: bool = False) -> int:
     t_run = time.time()
     provider_dir = Path(provider_uri).expanduser()
     out = Path(out_dir)

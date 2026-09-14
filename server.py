@@ -254,10 +254,26 @@ def main():
                     help="异步任务 worker 数（env MCP_WORKERS，默认 2）")
     ap.add_argument("--queue-size", type=int, default=int(os.environ.get("MCP_QUEUE_SIZE", "50")),
                     help="异步队列上限（env MCP_QUEUE_SIZE，默认 50）")
+    ap.add_argument("--job-timeout", type=int,
+                    default=int(os.environ.get("MCP_JOB_TIMEOUT_SEC", "3600")),
+                    help="异步任务 handler 级超时秒（env MCP_JOB_TIMEOUT_SEC，默认 3600；"
+                         "0=不超时；单工具可再经 MCP_JOB_TIMEOUT_<TOOL> 覆盖）")
     args = ap.parse_args()
 
     FactorHandler.license_store = LicenseStore(args.license_file, domain="factor")
-    FactorHandler.job_queue = JobQueue(HANDLERS, workers=args.workers, maxsize=args.queue_size)
+    FactorHandler.job_queue = JobQueue(HANDLERS, workers=args.workers, maxsize=args.queue_size,
+                                       handler_timeout_sec=args.job_timeout)
+
+    # 磁盘清理：启动时跑一次，之后每小时（job/回测目录 TTL + exec_cache LRU）
+    try:
+        import factor_worker as _fw
+        _summary = _fw.cleanup_disk()
+        _fw.start_cleanup_thread()
+        logger.info("disk cleanup done at startup: ttl=%ss removed=%s",
+                    _fw.CLEANUP_TTL_SEC,
+                    {k: len(v) for k, v in _summary.items() if v})
+    except Exception as e:  # noqa: BLE001 — 清理失败绝不影响服务启动
+        logger.warning("disk cleanup init failed: %s", e)
 
     server = ThreadingHTTPServer((args.host, args.port), FactorHandler)
     logger.info("factor MCP listening on %s:%d (tools=%d, auth=%s, workers=%d)",
