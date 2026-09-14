@@ -19,7 +19,9 @@ ARG APT_MIRROR
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=30 \
+    PIP_RETRIES=5
 
 WORKDIR /app
 
@@ -57,19 +59,21 @@ RUN pip install --no-index --find-links=/tmp/wheels pysocks socksio \
  && rm -rf /tmp/wheels
 
 COPY requirements.txt ./
-RUN pip install -r requirements.txt \
+# --timeout/--retries：镜像站偶发"连上但不回数据"，pip 默认无超时会永久 poll 在
+# 一个 socket 上（曾连续卡 54 分钟、构建缓存冻住）。给每次请求兜超时与重试。
+RUN pip install --timeout 30 --retries 5 -r requirements.txt \
     && arch="$(dpkg --print-architecture)" \
     && if [ "$WITH_QLIB" != "0" ]; then \
          if [ "$arch" = "amd64" ]; then \
-           pip install "pyqlib>=0.9.6" jinja2 mlflow; \
+           pip install --timeout 30 --retries 5 "pyqlib>=0.9.6" jinja2 mlflow; \
          elif [ "$WITH_QLIB" = "1" ]; then \
            if [ -n "$APT_MIRROR" ]; then \
              sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
            fi \
            && apt-get update \
            && apt-get install -y --no-install-recommends build-essential git \
-           && pip install "cython<3" "numpy>=1.26,<2" \
-           && pip install "git+${QLIB_GIT_URL}@v0.9.7" jinja2 mlflow \
+           && pip install --timeout 30 --retries 5 "cython<3" "numpy>=1.26,<2" \
+           && pip install --timeout 30 --retries 5 "git+${QLIB_GIT_URL}@v0.9.7" jinja2 mlflow \
            && apt-get purge -y build-essential git \
            && apt-get autoremove -y \
            && rm -rf /var/lib/apt/lists/*; \

@@ -54,6 +54,12 @@ DUMP_FIELDS = ["open", "high", "low", "close", "volume", "factor"]
 
 A_SHARE_RE = re.compile(r"^(60[0-9]{4}|68[0-9]{4}|00[0-9]{4}|30[0-9]{4})$")
 
+# A 股全市场量级下限：低于此值说明股票列表接口退化（截断/限流），
+# 绝不能拿它当 universe 去更新，否则日历会全局前移而只有极少数票拿到新 bar。
+MIN_UNIVERSE = int(os.environ.get("FACTOR_MINER_MIN_UNIVERSE", "2000") or 0)
+# staging 校验：close.day.bin 与日历对齐的 instrument 占比下限
+MIN_BIN_COVERAGE = float(os.environ.get("FACTOR_MIN_BIN_COVERAGE", "0.75") or 0)
+
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_NO_SOURCE = 3     # 数据源全挂 / 大面积失败
@@ -269,37 +275,77 @@ def build_fetcher(source: str, min_interval: float) -> ChainFetcher:
     return ChainFetcher(sources)
 
 
+def all_txt_codes(provider_dir: Path) -> list:
+    """instruments/all.txt 里的 A 股代码（本地已落库的存量universe）。"""
+    inst = provider_dir / "instruments" / "all.txt"
+    out = []
+    try:
+        for line in inst.read_text().splitlines():
+            sym = line.split("\t")[0].strip()
+            m = re.match(r"^(SH|SZ)(\d{6})$", sym)
+            if m and A_SHARE_RE.match(m.group(2)):
+                out.append(m.group(2))
+    except OSError as e:
+        log.warning("读取 %s 失败: %s", inst, e)
+    return out
+
+
 def list_symbols(provider_dir: Path) -> list:
-    """全市场 A 股代码。优先东财 clist 实时列表（含新上市，分页），失败回退
-    instruments/all.txt（会漏掉快照之后的新 IPO，下次成功时补上）。
-    BJ 股票腾讯/东财日 K 覆盖不全，v1 不含。"""
-    codes = []
+    """全市场 A 股代码。优先东财 clist 实时列表（含新上市），失败/退化回退
+    instruments/all.txt。BJ 股票腾讯/东财日 K 覆盖不全，v1 不含。
+
+    东财 clist 会**静默截断分页**（请求 pz=500 也只回 100 行，接口异常时甚至
+    只回 2 行），所以这里有三道防线，缺一不可：
+      1) 终止条件用响应里的 total，不再用 `len(diff) < pz`——一个被截断的短页
+         会被旧逻辑当成"列表到底了"，于是"全市场"退化成 100 只甚至 2 只；
+      2) 结果与 all.txt **求并集**，接口退化时不会丢掉存量票；
+      3) 少于 MIN_UNIVERSE 一律判为接口异常，直接以 all.txt 为准。
+    """
+    codes: list = []
+    total_seen = 0
+    degraded = False
     try:
         from .fetchers import em_get  # noqa: PLC0415
 
         for mkt in ("m:1+t:2,m:1+t:23", "m:0+t:6,m:0+t:80"):  # 沪A + 深A（含科创/创业）
-            pn, pz = 1, 500
+            pn, pz = 1, 100  # 东财实际单页上限 100
             while True:
                 r = em_get("https://82.push2.eastmoney.com/api/qt/clist/get", params={
                     "pn": str(pn), "pz": str(pz), "po": "1", "np": "1",
                     "fltt": "2", "invt": "2", "fs": mkt, "fields": "f12",
                 }, timeout=15)
-                diff = ((r.json() or {}).get("data") or {}).get("diff") or []
+                data = (r.json() or {}).get("data") or {}
+                diff = data.get("diff") or []
+                total_seen = max(total_seen, int(data.get("total") or 0))
                 codes += [str(d["f12"]) for d in diff if A_SHARE_RE.match(str(d.get("f12", "")))]
-                if len(diff) < pz:
+                if len(diff) < pz or (total_seen and pn * pz >= total_seen):
                     break
                 pn += 1
+                if pn > 200:  # 硬上限：防 total 异常导致死循环
+                    log.warning("clist 分页超过 200 页，强制结束")
+                    break
     except Exception as e:  # noqa: BLE001
         log.warning("东财 clist 获取股票列表失败, 回退 instruments/all.txt: %s", e)
-        codes = []
-    if not codes:
-        inst = provider_dir / "instruments" / "all.txt"
-        for line in inst.read_text().splitlines():
-            sym = line.split("\t")[0].strip()
-            m = re.match(r"^(SH|SZ)(\d{6})$", sym)
-            if m and A_SHARE_RE.match(m.group(2)):
-                codes.append(m.group(2))
-    return sorted(set(codes))
+        degraded = True
+
+    fetched = sorted(set(codes))
+    if not fetched:
+        degraded = True
+    elif total_seen and len(fetched) < total_seen * 0.8:
+        log.warning("clist 只取到 %d 只 / total=%d，判定分页截断", len(fetched), total_seen)
+        degraded = True
+    if fetched and len(fetched) < MIN_UNIVERSE:
+        log.error("clist 只返回 %d 只 (< %d)，判定接口异常", len(fetched), MIN_UNIVERSE)
+        degraded = True
+
+    old = all_txt_codes(provider_dir)
+    if degraded or not fetched:
+        out = old
+    else:
+        out = sorted(set(fetched) | set(old))  # 并集：绝不多丢存量
+    if len(out) < MIN_UNIVERSE:
+        log.error("股票列表仅 %d 只 (< %d)，all.txt 也可能不完整", len(out), MIN_UNIVERSE)
+    return out
 
 
 # ═══════════════ 老 bin 读取 / 复权对齐 ═══════════════
@@ -387,6 +433,42 @@ def validate_staging(staging: Path, expected_last_day: str, min_instruments: int
         want = len(cal) - int(arr[0])
         if len(arr) - 1 != want:
             raise ValidateError(f"{code} close bin 行数错位: {len(arr) - 1} != calendar 对齐值 {want}")
+    # 全量覆盖面：日历前移了、但只有极少数票真的写进新 bar —— 旧逻辑看不见这种
+    # "局部落库"（all.txt 行数由 copytree 继承、sample 又只抽刚更新的那几只），
+    # 结果就是日历全局前进而 99% 的票停在上一日。这里按 bin 与日历的对齐比例兜底。
+    aligned, checked = bin_alignment(staging, len(cal))
+    ratio = aligned / checked if checked else 0.0
+    need = max(1, int(min_instruments * MIN_BIN_COVERAGE))
+    if checked and (ratio < MIN_BIN_COVERAGE or aligned < need):
+        raise ValidateError(
+            f"新交易日覆盖面过低: {aligned}/{checked} ({ratio:.1%}) 只票的 bin 对齐日历尾"
+            f"（需要 ≥{need} 只），疑似只更新了部分标的")
+
+
+def bin_alignment(staging: Path, cal_len: int) -> tuple:
+    """统计 features/*/close.day.bin 中"行数与全局日历对齐"的只数。
+
+    只读每个 bin 的头 4 字节（起始索引）+ 文件大小，~6000 只票毫秒级。
+    退市/长期停牌的票天然对不齐，所以调用方用比例阈值而不是要求全对齐。
+    """
+    root = staging / "features"
+    aligned = checked = 0
+    try:
+        for d in root.iterdir():
+            p = d / "close.day.bin"
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if size < 4:
+                continue
+            checked += 1
+            start = int(np.fromfile(p, dtype="<f", count=1)[0])
+            if (size - 4) // 4 == cal_len - start:
+                aligned += 1
+    except OSError as e:
+        log.warning("覆盖面统计失败: %s", e)
+    return aligned, checked
 
 
 class ValidateError(Exception):
@@ -577,10 +659,17 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
     log.info("新交易日: %s", new_days)
 
     # 2. 股票列表 + 逐股抓取
+    auto_universe = symbols is None
     if symbols is None:
         symbols = list_symbols(provider_dir)
     if limit:
         symbols = symbols[:limit]
+    if auto_universe and len(symbols) < MIN_UNIVERSE:
+        # 接口退化时拿 100/2 只当"全市场"去跑，会推进全局日历却只写极少数票——
+        # 这正是 2026-09-08 起 4 个交易日只剩 SZ000001/SZ000002 的成因。
+        # 只拦自动发现的 universe；调用方显式指定 symbols 视为有意为之。
+        log.error("股票列表仅 %d 只 (< %d)，判定接口截断，保留旧数据", len(symbols), MIN_UNIVERSE)
+        return EXIT_NO_SOURCE
     log.info("待更新股票: %d 只 (source=%s)", len(symbols), source)
 
     inst_path = provider_dir / "instruments" / "all.txt"
@@ -655,7 +744,11 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
         dumper.dump()
 
         # 4. 校验
-        sample = (updated[:3] + new_syms[:2]) or updated[:5]
+        # 抽样要覆盖"刚更新的"和"存量里随机的"两面：只抽刚更新的几只时，
+        # 一旦只有少数票更新成功（局部落库），校验反而会因为抽到这几只而通过。
+        # old_end 的键是 SH600000 形式，这里剥掉市场前缀还原成 validate 要的 6 位码。
+        pool = sorted({k[2:] for k in old_end} | set(updated) | set(new_syms))
+        sample = random.sample(pool, min(30, len(pool))) if pool else []
         latest_day = new_days[-1] if new_days else calendar[-1].strftime("%Y-%m-%d")
         try:
             validate_staging(staging, latest_day, len(old_end), sample)

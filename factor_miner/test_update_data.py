@@ -266,3 +266,121 @@ def _write_bin_roundtrip_check():
     """防回归: 确认 fixture 的 bin 写入格式与 qlib 约定一致（float32 小端, 头=start_idx）。"""
     arr = np.hstack([[0], [1.0, 2.0]]).astype("<f")
     assert struct.unpack("<f", arr.tobytes()[:4])[0] == 0.0
+
+
+# ═══════════ 回归: "局部落库"事故（2026-09-08 起 4 天只剩 2 只票）═══════════
+#
+# 事故链条：东财 clist 静默截断分页（pz=500 只回 100 行，接口异常时只回 2 行）
+# → 旧代码 `if len(diff) < pz: break` 把短页当成"列表到底了"
+# → "全市场"退化成 2 只 → 全局日历照常前移，但只有这 2 只拿到新 bar
+# → staging 校验只抽"刚更新的那几只"（必然通过），污染被 atomic_swap 正式发布。
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._p = payload
+
+    def json(self):
+        return self._p
+
+
+def _clist_payload(codes, total):
+    return {"data": {"total": total, "diff": [{"f12": c} for c in codes]}}
+
+
+def test_list_symbols_pages_by_total_not_by_short_page(tmp_path, monkeypatch):
+    """第一页被截断成 100 行、但 total=250 → 必须继续翻页，而不是就此收工。"""
+    prov = make_provider(tmp_path)
+    pages = {}
+    for market in ("m:1+t:2,m:1+t:23", "m:0+t:6,m:0+t:80"):
+        base = "600" if market.startswith("m:1") else "000"
+        pages[market] = [
+            [f"{base}{i:03d}" for i in range(100)],          # 页1: 100 行（被截断）
+            [f"{base}{100 + i:03d}" for i in range(100)],    # 页2: 100 行
+            [f"{base}{200 + i:03d}" for i in range(50)],     # 页3: 50 行 → 到底
+        ]
+    seen = []
+
+    def fake_em_get(url, params=None, timeout=None):
+        market = params["fs"]
+        pn = int(params["pn"])
+        seen.append((market, pn))
+        page = pages[market][pn - 1] if pn <= len(pages[market]) else []
+        return _FakeResp(_clist_payload(page, total=250))
+
+    monkeypatch.setattr("factor_miner.fetchers.em_get", fake_em_get)
+    monkeypatch.setattr(ud, "MIN_UNIVERSE", 3)
+
+    out = ud.list_symbols(prov)
+    # 3 页共 500 只，再并入 all.txt 里接口没覆盖到的 600519
+    assert len(out) == 501, "必须按 total 翻满 3 页，而不是停在第一页的 100 行"
+    assert ("m:1+t:2,m:1+t:23", 3) in seen and ("m:0+t:6,m:0+t:80", 3) in seen
+
+
+def test_list_symbols_rejects_truncated_response_and_keeps_all_txt(tmp_path, monkeypatch):
+    """接口只回 2 行（成功、无异常）→ 判为退化，以 all.txt 为准，绝不缩成 2 只。"""
+    prov = make_provider(tmp_path)  # all.txt: SH600519 / SZ000001
+    monkeypatch.setattr("factor_miner.fetchers.em_get",
+                        lambda url, params=None, timeout=None: _FakeResp(
+                            _clist_payload(["000002", "000003"], total=5500)))
+    out = ud.list_symbols(prov)
+    assert set(out) == {"000001", "600519"}, "退化时必须回退到 all.txt 存量 universe"
+    assert "000002" not in out
+
+
+def test_list_symbols_union_keeps_old_on_partial_page(tmp_path, monkeypatch):
+    """取到的码与 all.txt 求并集：接口漏掉的存量票不会被丢掉。"""
+    prov = make_provider(tmp_path)
+    monkeypatch.setattr("factor_miner.fetchers.em_get",
+                        lambda url, params=None, timeout=None: _FakeResp(
+                            _clist_payload(["300999", "000002"], total=2)))
+    monkeypatch.setattr(ud, "MIN_UNIVERSE", 2)
+    out = ud.list_symbols(prov)
+    assert set(out) == {"000001", "600519", "000002", "300999"}
+
+
+def test_validate_rejects_partial_landing(tmp_path):
+    """日历前移、但只有 1/4 只票的 bin 对齐到日历尾 → 校验必须拒绝。"""
+    prov = make_provider(tmp_path)
+    cal = ud.read_calendar(prov) + [pd.Timestamp("2026-08-26"), pd.Timestamp("2026-08-27")]
+    (prov / "calendars" / "day.txt").write_text(
+        "\n".join(d.strftime("%Y-%m-%d") for d in cal) + "\n")
+    (prov / "instruments" / "all.txt").write_text(
+        "".join(f"{c}\t2020-01-02\t2026-08-27\n" for c in
+                ("SH600519", "SZ000001", "SZ000002", "SZ000003")))
+    # 只有 sh600519 真拿到了新 bar（4 行对齐 4 天日历），其余 3 只停在老的一天
+    _write_bin(prov / "features" / "sh600519" / "close.day.bin", 0, [1.0, 2.0, 3.0, 4.0])
+    for fname in ("sz000001", "sz000002", "sz000003"):
+        _write_bin(prov / "features" / fname / "close.day.bin", 0, [1.0])
+
+    with pytest.raises(ud.ValidateError, match="覆盖面过低"):
+        ud.validate_staging(prov, "2026-08-27", 4, ["600519"])
+
+
+def test_validate_accepts_full_landing(tmp_path):
+    """全部对齐时正常放行（阈值用 min_instruments 定标，小 universe 单测不受影响）。"""
+    prov = make_provider(tmp_path)
+    for fname in ("sh600519", "sz000001"):
+        _write_bin(prov / "features" / fname / "close.day.bin", 0, [1.0, 2.0])
+    ud.validate_staging(prov, "2026-08-25", 2, ["600519", "000001"])
+    aligned, checked = ud.bin_alignment(prov, 2)
+    assert (aligned, checked) == (2, 2)
+
+
+def test_run_refuses_degenerate_auto_universe(tmp_path, monkeypatch):
+    """自动发现 universe 只有 2 只 → 拒绝更新并保留旧日历（零副作用）。"""
+    prov = make_provider(tmp_path)
+    monkeypatch.setattr(ud, "list_symbols", lambda p: ["000001", "600519"])
+    rc = ud.run(str(prov), str(tmp_path / "mining"), fetcher=_normal_fetcher(), skip_h5=True)
+    assert rc == ud.EXIT_NO_SOURCE
+    assert ud.read_calendar(prov)[-1] == pd.Timestamp("2026-08-25")
+    assert not (tmp_path / "cn_data.__staging__").exists()
+
+
+def test_run_allows_explicit_small_symbols(tmp_path):
+    """调用方显式传 symbols（联调/定向回补）不受 MIN_UNIVERSE 限制。"""
+    prov = make_provider(tmp_path)
+    rc = ud.run(str(prov), str(tmp_path / "mining"), fetcher=_normal_fetcher(),
+                symbols=["000001", "600519"], skip_h5=True)
+    assert rc == ud.EXIT_OK
+    assert ud.read_calendar(prov)[-1] == pd.Timestamp("2026-08-27")
