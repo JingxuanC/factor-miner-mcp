@@ -526,3 +526,22 @@ def test_validate_still_catches_active_instrument_shortfall(tmp_path):
     _write_bin(prov / "features" / "sz000001" / "close.day.bin", 0, [1.0])   # 说 08-27 却只 1 行
     with pytest.raises(ud.ValidateError, match="行数错位"):
         ud.validate_staging(prov, "2026-08-27", 2, ["600519", "000001"])
+
+
+def test_validate_distinguishes_index_from_stock_with_same_code(tmp_path, monkeypatch):
+    """同码相撞：SH000852(中证1000指数) 与 SZ000852(石化机械)。抽样给的是带前缀的
+    完整符号，必须精确命中股票目录；按 6 位尾码查会拿到指数目录 → 误杀整次落库。"""
+    prov = make_provider(tmp_path)
+    cal = ud.read_calendar(prov) + [pd.Timestamp("2026-08-26"), pd.Timestamp("2026-08-27")]
+    (prov / "calendars" / "day.txt").write_text(
+        "\n".join(d.strftime("%Y-%m-%d") for d in cal) + "\n")
+    (prov / "instruments" / "all.txt").write_text(
+        "SH600519\t2020-01-02\t2026-08-27\nSZ000852\t2020-01-02\t2026-08-27\n"
+        "SH000852\t2014-10-17\t2026-08-27\n")
+    _write_bin(prov / "features" / "sh600519" / "close.day.bin", 0, [1.0, 2.0, 3.0, 4.0])
+    _write_bin(prov / "features" / "sz000852" / "close.day.bin", 0, [1.0, 2.0, 3.0, 4.0])
+    _write_bin(prov / "features" / "sh000852" / "close.day.bin", 0, [1.0, 2.0])   # 指数（落后）
+    dirs = ud.feature_instruments(prov)
+    assert dirs["sz000852"] == "sz000852" and dirs["sh000852"] == "sh000852"
+    monkeypatch.setattr(ud, "MIN_BIN_COVERAGE", 0.4)   # 覆盖面比例是另一道守卫
+    ud.validate_staging(prov, "2026-08-27", 3, ["sz000852", "sh600519"])   # 不该抛

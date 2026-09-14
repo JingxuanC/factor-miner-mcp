@@ -427,7 +427,11 @@ def feature_instruments(staging: Path) -> dict:
     try:
         for d in (staging / "features").iterdir():
             if d.is_dir() and len(d.name) > 6:
-                out[d.name[-6:].upper()] = d.name
+                # 两种键都放：**小写完整符号**（精确，推荐）与 6 位裸码（兼容旧调用）。
+                # 只用裸码会撞车：SH000852(中证1000指数) 与 SZ000852(石化机械) 同码，
+                # 抽到指数就会拿"永远不更新"的 bin 去校验 → 误杀（2026-09-14 踩过）。
+                out[d.name.lower()] = d.name
+                out.setdefault(d.name[-6:].upper(), d.name)
     except OSError as e:
         log.warning("features 目录读取失败: %s", e)
     return out
@@ -451,20 +455,24 @@ def validate_staging(staging: Path, expected_last_day: str, min_instruments: int
         for line in (staging / "instruments" / "all.txt").read_text().splitlines():
             parts = line.split("\t")
             if len(parts) >= 3:
-                ends[parts[0].strip().upper()[-6:]] = parts[2].strip()
+                full = parts[0].strip().upper()
+                ends[full.lower()] = parts[2].strip()
+                ends.setdefault(full[-6:], parts[2].strip())
     except OSError as e:
         log.warning("读 instruments/all.txt 失败: %s", e)
     cal_last = cal[-1].strftime("%Y-%m-%d")
     for code in sample_codes:
-        key = str(code)[-6:].upper()
-        name = dirs.get(key)
+        sym = str(code).lower()
+        key = sym[-6:].upper()
+        # 优先按**完整符号**精确查（避免指数/股票同码相撞），回落到裸码
+        name = dirs.get(sym) or dirs.get(key)
         bin_path = staging / "features" / name / "close.day.bin" if name else None
         if not name or not bin_path.exists():
             raise ValidateError(f"{code} close.day.bin 缺失")
         arr = np.fromfile(bin_path, dtype="<f")
         want = len(cal) - int(arr[0])
         if len(arr) - 1 != want:
-            own_end = ends.get(key, "")
+            own_end = ends.get(sym, "") or ends.get(key, "")
             if own_end and own_end < cal_last:
                 continue
             raise ValidateError(
@@ -816,9 +824,10 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
         # 数据集范围的广度由 validate_staging 的**覆盖面比例**负责——退市/长期停牌票
         # 天然落后，混进抽样会误杀整次落库（2026-09-14 踩过）。
         _dirs = feature_instruments(staging)
-        written = [c for c in updated + new_syms if str(c)[-6:].upper() in _dirs]
-        sample = sorted(set(updated[:3]) | set(new_syms[:2]) |
-                        (set(random.sample(written, min(25, len(written)))) if written else set()))
+        full = [market_of(c) + c for c in updated + new_syms]      # 带市场前缀，避免同码相撞
+        written = [f for f in full if f in _dirs]
+        head = [market_of(c) + c for c in (updated[:3] + new_syms[:2])]
+        sample = sorted(set(head) | (set(random.sample(written, min(25, len(written)))) if written else set()))
         latest_day = new_days[-1] if new_days else calendar[-1].strftime("%Y-%m-%d")
         try:
             validate_staging(staging, latest_day, len(old_end), sample)
