@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tools import EXTRA_SCHEMAS, HANDLERS, TOOLS  # noqa: F401 — 副作用：注册全部工具
 
 from mcp_gateway import METRICS, JobQueue, LicenseStore, QueueFull, QuotaExceeded
+from mcp_common import coerce_args
 
 logger = logging.getLogger("factor-mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -197,6 +198,16 @@ class FactorHandler(BaseHTTPRequestHandler):
             if tool_name not in HANDLERS:
                 self._send(200, {"jsonrpc": "2.0", "id": mid,
                                  "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}})
+                return
+            # 参数类型强制（mcp-common）：LLM 常把数字传成字符串（max_lag="2"）或显式
+            # 传 null。放在派发之前 —— 坏参数不消耗配额、不进队列，并给出点名参数与
+            # 期望类型的可操作错误（原先要等 handler 抛 TypeError，客户端只看到
+            # 一句 Python 异常栈，无法据此纠正）。
+            tool_args, _arg_err = coerce_args(HANDLERS, tool_name, tool_args)
+            if _arg_err is not None:
+                METRICS.inc_call(tool_name, "rejected_args")
+                self._send(200, {"jsonrpc": "2.0", "id": mid, "result": {
+                    "content": [{"type": "text", "text": _arg_err}], "isError": True}})
                 return
             is_async = tool_name in ASYNC_TOOLS and self.job_queue
             # 额度：先扣再跑（异步任务失败不退还——成本已发生）
