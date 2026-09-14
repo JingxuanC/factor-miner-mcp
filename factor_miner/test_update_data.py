@@ -494,3 +494,35 @@ def test_explicit_csv_dir_survives_validation_failure(tmp_path, monkeypatch):
     assert rc == ud.EXIT_VALIDATE
     assert sorted(p.name for p in csv_dir.glob("*.csv")) == ["sh600519.csv", "sz000001.csv"]
     assert ud.read_calendar(prov)[-1] == pd.Timestamp("2026-08-25"), "旧数据必须保留"
+
+
+def test_validate_tolerates_legitimately_stopped_instrument(tmp_path, monkeypatch):
+    """退市/长期停牌票的 bin 天然落后于日历尾（自身 end 更早）→ 必须容忍，
+    否则一次正确的落库会被误杀（2026-09-14：000413 因历史长期停牌被拦下）。"""
+    prov = make_provider(tmp_path)
+    cal = ud.read_calendar(prov) + [pd.Timestamp("2026-08-26"), pd.Timestamp("2026-08-27")]
+    (prov / "calendars" / "day.txt").write_text(
+        "\n".join(d.strftime("%Y-%m-%d") for d in cal) + "\n")
+    # 600519 更新到新日历尾；000413 自身 end 停在 08-25（已退市/停牌）
+    (prov / "instruments" / "all.txt").write_text(
+        "SH600519\t2020-01-02\t2026-08-27\nSZ000413\t2020-01-02\t2026-08-25\n")
+    _write_bin(prov / "features" / "sh600519" / "close.day.bin", 0, [1.0, 2.0, 3.0, 4.0])
+    _write_bin(prov / "features" / "sz000413" / "close.day.bin", 0, [1.0, 2.0])   # 只有 2 行
+    # 覆盖面**比例**是另一道守卫（真实数据集里落后票只占 ~5.6%）；这里样本只有 2 只，
+    # 放宽比例阈值，专测"逐只抽样要容忍合法落后"这一条。
+    monkeypatch.setattr(ud, "MIN_BIN_COVERAGE", 0.3)   # 1/3 对齐 ≥ 0.3
+    ud.validate_staging(prov, "2026-08-27", 2, ["600519", "000413"])   # 不该抛
+
+
+def test_validate_still_catches_active_instrument_shortfall(tmp_path):
+    """活跃票（自身 end 就是日历尾）行数不足 → 照旧拦截，不能为了修误报放水。"""
+    prov = make_provider(tmp_path)
+    cal = ud.read_calendar(prov) + [pd.Timestamp("2026-08-26"), pd.Timestamp("2026-08-27")]
+    (prov / "calendars" / "day.txt").write_text(
+        "\n".join(d.strftime("%Y-%m-%d") for d in cal) + "\n")
+    (prov / "instruments" / "all.txt").write_text(
+        "SH600519\t2020-01-02\t2026-08-27\nSZ000001\t2020-01-02\t2026-08-27\n")
+    _write_bin(prov / "features" / "sh600519" / "close.day.bin", 0, [1.0, 2.0, 3.0, 4.0])
+    _write_bin(prov / "features" / "sz000001" / "close.day.bin", 0, [1.0])   # 说 08-27 却只 1 行
+    with pytest.raises(ud.ValidateError, match="行数错位"):
+        ud.validate_staging(prov, "2026-08-27", 2, ["600519", "000001"])

@@ -443,15 +443,33 @@ def validate_staging(staging: Path, expected_last_day: str, min_instruments: int
     if n_inst < min_instruments:
         raise ValidateError(f"instruments 回退: {n_inst} < {min_instruments}")
     dirs = feature_instruments(staging)
+    # 该票**自己声明的** end 日期：退市/长期停牌的票本来就落后于日历尾，
+    # 逐只要求"必须对齐日历尾"会把它们判成错误，从而否掉一次正确的落库
+    # （2026-09-14 实际发生：000413 因历史长期停牌只有 5966 行被拦下）。
+    ends = {}
+    try:
+        for line in (staging / "instruments" / "all.txt").read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                ends[parts[0].strip().upper()[-6:]] = parts[2].strip()
+    except OSError as e:
+        log.warning("读 instruments/all.txt 失败: %s", e)
+    cal_last = cal[-1].strftime("%Y-%m-%d")
     for code in sample_codes:
-        name = dirs.get(str(code)[-6:].upper())
+        key = str(code)[-6:].upper()
+        name = dirs.get(key)
         bin_path = staging / "features" / name / "close.day.bin" if name else None
         if not name or not bin_path.exists():
             raise ValidateError(f"{code} close.day.bin 缺失")
         arr = np.fromfile(bin_path, dtype="<f")
         want = len(cal) - int(arr[0])
         if len(arr) - 1 != want:
-            raise ValidateError(f"{code} close bin 行数错位: {len(arr) - 1} != calendar 对齐值 {want}")
+            own_end = ends.get(key, "")
+            if own_end and own_end < cal_last:
+                continue
+            raise ValidateError(
+                f"{code} close bin 行数错位: {len(arr) - 1} != calendar 对齐值 {want}"
+                f"(自身 end={own_end or '?'}, 日历尾={cal_last})")
     # 全量覆盖面：日历前移了、但只有极少数票真的写进新 bar —— 旧逻辑看不见这种
     # "局部落库"（all.txt 行数由 copytree 继承、sample 又只抽刚更新的那几只），
     # 结果就是日历全局前进而 99% 的票停在上一日。这里按 bin 与日历的对齐比例兜底。
@@ -794,8 +812,13 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
         # 一旦只有少数票更新成功（局部落库），校验反而会因为抽到这几只而通过。
         # 池子取自**数据集里真实存在的标的**（而不是 all.txt）：all.txt 的条目未必
         # 都有 features 目录，抽到那种条目只会误报"bin 缺失"。
-        pool = sorted(set(feature_instruments(staging)) | {str(c).upper() for c in updated + new_syms})
-        sample = sorted(set(random.sample(pool, min(30, len(pool)))) | set(updated[:3]) | set(new_syms[:2])) if pool else []
+        # 抽样只取**本轮真写过的**票：逐只"必须对齐日历尾"只对刚写的票成立。
+        # 数据集范围的广度由 validate_staging 的**覆盖面比例**负责——退市/长期停牌票
+        # 天然落后，混进抽样会误杀整次落库（2026-09-14 踩过）。
+        _dirs = feature_instruments(staging)
+        written = [c for c in updated + new_syms if str(c)[-6:].upper() in _dirs]
+        sample = sorted(set(updated[:3]) | set(new_syms[:2]) |
+                        (set(random.sample(written, min(25, len(written)))) if written else set()))
         latest_day = new_days[-1] if new_days else calendar[-1].strftime("%Y-%m-%d")
         try:
             validate_staging(staging, latest_day, len(old_end), sample)
