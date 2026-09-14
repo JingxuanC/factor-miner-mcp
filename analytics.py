@@ -195,9 +195,13 @@ def factor_tearsheet(factor_values: list, klines: dict,
 def _hrp_weights(cov: pd.DataFrame) -> pd.Series:
     """HRP（López de Prado 2016）：相关距离 → 层次聚类 → 拟对角化 → 递归二分。"""
     corr = cov.corr().fillna(0.0).clip(-1, 1)
-    dist = np.sqrt(0.5 * (1 - corr))  # 相关距离矩阵
-    np.fill_diagonal(dist.values, 0.0)
-    link = linkage(squareform(dist.values, checks=False), method="single")
+    # np.sqrt(DataFrame) 返回的底层数组在部分 pandas 版本下是**只读视图**，
+    # 直接 np.fill_diagonal(dist.values, ...) 会抛 "underlying array is read-only"。
+    # 2026-09-14 实测：HRP 路径因此**从未跑通过**（而它是组合优化的默认方法）。
+    # 显式 copy 成可写 ndarray；后续只把 dist 当距离矩阵用，无需保留 DataFrame。
+    dist = np.sqrt(0.5 * (1 - corr)).to_numpy(copy=True)
+    np.fill_diagonal(dist, 0.0)
+    link = linkage(squareform(dist, checks=False), method="single")
     order = leaves_list(link)  # 拟对角化排序
     sorted_cov = cov.iloc[order, order]
 
