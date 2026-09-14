@@ -223,6 +223,13 @@ class RollingTrainer:
 
         with open(self.model_path, "wb") as f:
             pickle.dump(model, f)
+        # 特征名必须跟模型一起落盘：原先只存在 self._feature_names（内存态），
+        # 进程一换就变 None → predict 里每只票都 continue → 返回
+        # {"status":"ok","n_predicted":0}（一只都没算却报成功，2026-09-14 实测）。
+        # LightGBM 模型自己也不带名字（feature_name() 为 None，因为是按 numpy 数组训的），
+        # 所以只能由训练侧把顺序写下来。
+        if self._feature_names:
+            self._save_feature_names(self._feature_names)
 
         top_feats = []
         if self._feature_names:
@@ -269,6 +276,45 @@ class RollingTrainer:
             for k in klines
         ]
 
+    @property
+    def _feature_names_path(self) -> str:
+        return self.model_path.replace(".pkl", ".features.json")
+
+    def _save_feature_names(self, names: List[str]) -> None:
+        try:
+            with open(self._feature_names_path, "w") as f:
+                json.dump(list(names), f)
+        except OSError as e:  # noqa: BLE001 — 落盘失败不该让训练整体失败，但必须可见
+            print("feature names sidecar 写入失败: %s" % e, file=sys.stderr)
+
+    def _load_feature_names(self) -> Optional[List[str]]:
+        """从 sidecar 读回特征名（训练侧写的）。缺失/损坏返回 None。"""
+        try:
+            with open(self._feature_names_path) as f:
+                names = json.load(f)
+            return [str(x) for x in names] if names else None
+        except (OSError, ValueError):
+            return None
+
+    def _resolve_features(self, model, factors: dict) -> "tuple[Optional[List[str]], Optional[str]]":
+        """定出打分要用的特征名与顺序 → (names, err)。
+
+        顺序**不是猜的**：train() 用的就是 `sorted(feats.keys())`，这里逐字复用同一
+        表达式（同一个 FactorEngine、同一批键），所以顺序必然与训练一致。
+        最后再拿模型的 n_features_in_ 做长度校验——不一致就显式报错，
+        绝不带着错位的特征向量去打分（那会产出看着像样的垃圾预测）。
+        """
+        names = self._feature_names or self._load_feature_names()
+        if not names and factors:
+            names = sorted(factors.keys())
+        if not names:
+            return None, "无法确定特征名（engine 未产出因子且 sidecar 缺失）"
+        n_expect = getattr(model, "n_features_in_", None)
+        if n_expect and len(names) != int(n_expect):
+            return None, ("特征数与模型不匹配: 解析出 %d 个、模型要 %d 个"
+                          % (len(names), int(n_expect)))
+        return names, None
+
     def predict(self, klines_list: List[dict]) -> dict:
         """Generate next-day predictions from latest klines.
 
@@ -312,10 +358,14 @@ class RollingTrainer:
                 })
                 factors = result.get("factors", {})
 
-            if not factors or self._feature_names is None:
+            names, err = self._resolve_features(model, factors)
+            if err:
+                return {"status": "error", "message": err, "n_predicted": 0, "predictions": {}}
+            self._feature_names = names          # 一次解析，后续票复用同一顺序
+            if not factors:
                 continue
 
-            X_row = np.array([[factors.get(k, 0.0) for k in self._feature_names]], dtype=np.float32)
+            X_row = np.array([[factors.get(k, 0.0) for k in names]], dtype=np.float32)
             pred = float(model.predict(X_row)[0])
 
             if self.redis:
@@ -325,6 +375,10 @@ class RollingTrainer:
                 )
             results[sym] = round(pred, 6)
 
+        if not results:
+            # 绝不返回 "ok + 0 只"：那等于让调用方以为打过分了（2026-09-14 踩过）。
+            return {"status": "error", "n_predicted": 0, "predictions": {},
+                    "message": "没有可打分的标的（factors 全空 / 缺 klines / 特征名不可解析）"}
         return {"status": "ok", "n_predicted": len(results), "predictions": results}
 
     # ── MASTER（深度学习后端，截面 Transformer）─────────────────────────
