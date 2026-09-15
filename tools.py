@@ -284,13 +284,20 @@ def change_point(series: Any, method: str = "auto", max_bkps: int = 5) -> str:
     return analytics.change_point(series, method, max_bkps)
 
 
-@tool("vol_forecast", "Volatility forecast: built-in EWMA (RiskMetrics 1996, lambda=0.94, flat "
-      "multi-day extrapolation) + Parkinson high/low reference when OHLC given; GARCH(1,1) via "
-      "arch when installed (lazy import). Returns JSON string: "
-      "{forecast: [{day, vol}], current_vol, method} (daily vol as decimal).",
+@tool("vol_forecast", "Volatility forecast with a real term structure: mean-reverting EWMA "
+      "(EWMA current variance + AR(1) mean reversion estimated from rolling realized variance, "
+      "phi & long-run vol reported, pure numpy) is the default; pure RiskMetrics EWMA "
+      "(lambda=0.94) is available explicitly and is FLAT by construction (no mean reversion, "
+      "therefore no term structure); GARCH(1,1) via arch when installed (lazy import); "
+      "Parkinson high/low reference when OHLC given. Returns JSON string: "
+      "{forecast: [{day, vol}], current_vol, method, term_structure, horizon_ratio, phi?, "
+      "long_run_vol?, half_life_days?} (daily vol as decimal).",
       {"klines": _PANEL_SCHEMA,
        "horizon": {"type": "integer", "description": "Forecast days ahead (default 5)", "default": 5},
-       "method": {"type": "string", "enum": ["auto", "ewma", "garch"], "default": "auto"}},
+       "method": {"type": "string", "enum": ["auto", "ewma", "ewma_mr", "garch"], "default": "auto",
+                  "description": "auto=有 arch 走 GARCH，否则走均值回复 ewma_mr；"
+                                 "ewma=纯 RiskMetrics（多期天然平坦，无期限结构）；"
+                                 "ewma_mr=EWMA 当前方差 + AR(1) 均值回复，有期限结构"}},
       required=["klines"])
 def vol_forecast(klines: Any, horizon: int = 5, method: str = "auto") -> str:
     import analytics
@@ -332,8 +339,19 @@ EXTRA_SCHEMAS = {
     "compute_factors": {"name": "compute_factors", "description": "Compute Alpha158 factors from OHLCV data",
                         "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}, "klines": {"type": "array"}},
                                         "required": []}},
-    "predict": {"name": "predict", "description": "ML model prediction from factor values",
-                "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}, "factors": {"type": "object"}},
+    # predict 是 Phase-0 占位引擎（models.ModelEngine），**不是**训练模型推理。
+    # 2026-09-15 实测：缺输入时它恒返回 signal=0.0/confidence=0.5，会被上层误当
+    # 成真实模型输出。现在缺输入返回 status=insufficient_input 且 signal/confidence
+    # 为 null；真推理请用 ml_predict（需 klines_list）。
+    "predict": {"name": "predict",
+                "description": "Phase-0 PLACEHOLDER engine (NOT a trained model). "
+                               "Requires factors {roc_5, volume_ratio, ...}; returns "
+                               "status=insufficient_input with null signal/confidence when "
+                               "inputs are missing, and always sets is_mock=true. "
+                               "For real inference use ml_predict (needs klines_list).",
+                "inputSchema": {"type": "object",
+                                "properties": {"symbol": {"type": "string"},
+                                               "factors": {"type": "object"}},
                                 "required": []}},
 }
 

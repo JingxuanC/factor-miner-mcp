@@ -509,6 +509,60 @@ def change_point(series: list, method: str = "auto", max_bkps: int = 5) -> str:
 # 5. vol_forecast — EWMA(RiskMetrics) / (可选) GARCH(1,1)
 # ═══════════════════════════════════════════════════════════════
 
+def _ewma_var(ret, lam: float = 0.94) -> float:
+    """RiskMetrics (1996) EWMA 方差：σ²_{t+1} = λσ²_t + (1−λ)r²_t。"""
+    var = float((ret ** 2).iloc[:20].mean())
+    for r in ret.values:
+        var = lam * var + (1 - lam) * r * r
+    return var
+
+
+def _mean_reverting_vol(ret, horizon: int, lam: float = 0.94):
+    """带期限结构的波动率预测：EWMA 当前方差 + AR(1) 均值回复。
+
+    σ²_{t+h} = LR + (σ²_{t+1} − LR)·φ^h
+
+    φ 与 LR 由**滚动已实现方差对自身滞后一期**的 OLS 估计（纯 numpy，不依赖
+    arch/GARCH）。纯 EWMA 隐含 φ=1（无均值回复），所以多期预测**天然平坦** ——
+    那是 RiskMetrics 的定义而非 bug，但拿不到任何期限结构，无法用于按 horizon
+    缩放仓位。这里补上这条路径。
+
+    返回 ``None`` 表示样本不足以估计（调用方回退到平坦 EWMA）。
+    """
+    if len(ret) < 60:
+        return None
+    var_cur = _ewma_var(ret, lam)
+    if not np.isfinite(var_cur) or var_cur <= 0:
+        return None
+    rv = (ret ** 2).rolling(20).mean().dropna()
+    if len(rv) < 40:
+        return None
+    x = rv.to_numpy()[:-1]
+    y = rv.to_numpy()[1:]
+    xm, ym = float(x.mean()), float(y.mean())
+    denom = float(((x - xm) ** 2).sum())
+    if denom <= 1e-18:
+        return None
+    phi = float(((x - xm) * (y - ym)).sum() / denom)
+    if not np.isfinite(phi):
+        return None
+    phi = min(max(phi, 1e-6), 0.999)      # 数值保护：φ<1 才收敛
+    a = ym - phi * xm
+    lr = a / (1.0 - phi)
+    if not np.isfinite(lr) or lr <= 0:
+        lr = float(rv.mean())             # 退化时用样本均值当长期方差
+    # 防离谱外推：长期方差不超过当前方差的 100 倍
+    lr = min(max(lr, 1e-12), 100.0 * var_cur)
+    var_path = [lr + (var_cur - lr) * (phi ** h) for h in range(1, horizon + 1)]
+    half_life = float(np.log(0.5) / np.log(phi)) if 0 < phi < 1 else None
+    return {
+        "var_path": var_path,
+        "phi": phi,
+        "long_run_var": lr,
+        "half_life_days": half_life,
+    }
+
+
 def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
     horizon = max(1, int(horizon))
     try:
@@ -520,7 +574,7 @@ def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
     ret = close.pct_change().dropna()
     method = (method or "auto").lower()
 
-    forecast, used = None, "ewma"
+    forecast, used, extra = None, "ewma", {}
     if method in ("auto", "garch"):
         try:
             from arch import arch_model  # 惰性导入可选增强
@@ -530,6 +584,9 @@ def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
             var = f.variance.values[-1] / 1e4  # %² → 小数²
             forecast = [float(np.sqrt(v)) for v in var]
             used = "garch"
+            # GARCH(1,1) 本身向长期方差回复，期限结构是模型推断出来的
+            extra = {"term_structure": "mean_reverting",
+                     "note": "GARCH(1,1) 自带均值回复，长期方差由模型参数决定"}
         except ImportError:
             if method == "garch":
                 return json.dumps({"error": "garch 需安装 arch；或用 method=auto"})
@@ -537,19 +594,40 @@ def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
             forecast, used = None, "ewma"  # 拟合失败回退 EWMA
 
     if forecast is None:
-        lam = 0.94  # RiskMetrics (1996)
-        var = float((ret ** 2).iloc[:20].mean())
-        for r in ret.values:
-            var = lam * var + (1 - lam) * r * r
-        # EWMA 多期预测为平坦外推：E[σ²_{t+h}] = σ²_{t+1}
-        forecast = [float(np.sqrt(var))] * horizon
-        used = "ewma"
+        mr = None
+        if method in ("auto", "ewma_mr"):
+            mr = _mean_reverting_vol(ret, horizon)
+        if mr is not None:
+            forecast = [float(np.sqrt(v)) for v in mr["var_path"]]
+            used = "ewma_mr"
+            extra = {
+                "phi": mr["phi"],
+                "long_run_vol": float(np.sqrt(mr["long_run_var"])),
+                "half_life_days": mr["half_life_days"],
+                "term_structure": "mean_reverting",
+            }
+        else:
+            lam = 0.94  # RiskMetrics (1996)
+            var = _ewma_var(ret, lam)
+            # EWMA 无均值回复，多期预测**天然平坦**：E[σ²_{t+h}] = σ²_{t+1}。
+            # 这是 RiskMetrics 的定义，不是 bug —— 但要期限结构必须走 auto/ewma_mr。
+            forecast = [float(np.sqrt(var))] * horizon
+            used = "ewma"
+            extra = {
+                "term_structure": "flat",
+                "note": "EWMA 无均值回复，多期预测天然平坦；需要期限结构请用 "
+                        "method=auto 或 method=ewma_mr",
+            }
 
     out = {
         "forecast": [{"day": i + 1, "vol": v} for i, v in enumerate(forecast)],
         "current_vol": forecast[0],
         "method": used,
+        # 期限结构的可见性：末/首比。=1.0 表示平坦
+        "horizon_ratio": (float(forecast[-1] / forecast[0])
+                          if forecast[0] > 0 else None),
     }
+    out.update(extra)
     # 输入**真实**含 high/low 时附 Parkinson (1980) 波动率参考。
     # 必须问 panel.present_fields，而不是看归一化后的列：归一化会用 close 补齐
     # high/low，直接算会得到 log(1)²=0 的假零波动率。

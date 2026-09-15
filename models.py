@@ -13,21 +13,33 @@ class ModelEngine:
     def predict(self, factors: dict) -> dict:
         """Run ML prediction on computed factors.
 
-        Args:
-            factors: {
-                "symbol": "600519",
-                "factors": {"roc_5": 0.02, "ma_20": 1850.5, ...}
-            }
-
-        Returns:
-            {
-                "symbol": "600519",
-                "signal": 0.023,
-                "confidence": 0.65
-            }
+        2026-09-15 修订：本引擎是 **Phase 0 占位实现**，只认 roc_5 / volume_ratio /
+        std_20 / mfv 四个入参。此前缺输入时会恒返回 ``signal=0.0``、
+        ``confidence=0.5``，而 MCP 工具 ``predict`` 把它原样透出 ——
+        调用方无从分辨那是一个真实模型输出还是"什么都没算"（实测就是这个现象）。
+        现在：
+        - 缺必需输入 → ``status="insufficient_input"``，signal/confidence 为 ``None``
+        - 任何情况下都带 ``is_mock=True`` / ``method="phase0_mock"``
+        - 真实推理用 ``ml_predict``（需 klines_list）
         """
         symbol = factors.get("symbol", "")
-        factor_values = factors.get("factors", {})
+        factor_values = factors.get("factors", {}) or {}
+
+        required = ("roc_5", "volume_ratio")
+        missing = [k for k in required if k not in factor_values]
+        if missing:
+            return {
+                "symbol": symbol,
+                "signal": None,
+                "confidence": None,
+                "status": "insufficient_input",
+                "is_mock": True,
+                "method": "phase0_mock",
+                "missing": missing,
+                "error": "Phase-0 占位引擎缺少必需输入 %s；它只有 roc_5/volume_ratio/"
+                         "std_20/mfv 四个入参，真实推理请用 ml_predict（需 klines_list）"
+                         % missing,
+            }
 
         # Phase 0: Simple heuristic-based mock prediction.
         # In later phases this will be replaced with an ONNX model.
@@ -38,6 +50,10 @@ class ModelEngine:
             "symbol": symbol,
             "signal": signal,
             "confidence": confidence,
+            "status": "ok",
+            "is_mock": True,
+            "method": "phase0_mock",
+            "note": "Phase-0 占位实现，非训练模型输出；真实推理请用 ml_predict",
         }
 
     def _mock_signal(self, factor_values: dict) -> float:
