@@ -33,10 +33,20 @@ import sys
 from dataclasses import dataclass, field
 
 # RLIMIT_AS：地址空间硬上限。注意这是**虚拟地址空间**（含 mmap），不是 RSS ——
-# pandas/pytables 读一张宽表时 VA 远高于实际驻留内存。默认 2GB 对"按窗口截取后的
-# 数据"足够（见 factor_worker.WINDOW_DAYS）；若确需喂全量历史，把
-# FACTOR_MINER_MAX_AS_BYTES 调大（宿主 7.3G，留足余量再调）。
-MAX_AS_BYTES = int(os.environ.get("FACTOR_MINER_MAX_AS_BYTES", 2 * 1024 * 1024 * 1024))
+# pandas/pytables 读一张宽表时 VA 远高于实际驻留内存。
+#
+# 默认从 2GB 提到 4GB：2026-09-15 实测，2GB 连**读完** daily_pv_all.h5 都不够
+# （15,126,361 行 × 6 列 float32；报错 Unable to allocate 346 MiB for
+# shape (6, 15126361)）。解释器 + mmap 423MB 文件 + 346MiB 数组 + concat 临时副本
+# 叠加后 VA 超 2GB。关键背景：daily_pv*.h5 是 **Fixed 格式** HDF store，
+# `columns=` 选列不被允许（TypeError: cannot pass a column specification when
+# reading a Fixed format store），所以「只读需要的列」这条路走不通，全量读不可避。
+#
+# _exec_factor_worker（factor_backtest / factor_oos_check 走这条）是**无条件
+# symlink 全量数据**的，因此默认值必须能容纳全量读，否则那两个工具开箱即死。
+# 实测：4GB 通过，6GB 同样通过；按窗口截取的路径（factor_worker.WINDOW_DAYS，
+# 供 factor_recent_ic 用）峰值仅约 1.2GB，不受影响。
+MAX_AS_BYTES = int(os.environ.get("FACTOR_MINER_MAX_AS_BYTES", 4 * 1024 * 1024 * 1024))
 MAX_CPU_SECONDS = 300
 DEFAULT_TIMEOUT_SECONDS = 120
 # RLIMIT_FSIZE：单文件最大字节。4GB 远高于 result.h5 实际体量，只为挡"写爆磁盘"
@@ -75,6 +85,10 @@ DENIED_FILE_METHODS = {
     "write_text", "write_bytes", "symlink_to", "hardlink_to", "unlink",
     "rmdir", "rmtree", "mkdtemp", "chmod", "lchmod", "replace", "rename",
 }
+# DENIED_FILE_METHODS 里与 pandas/DataFrame 方法同名的项：这些名字在因子代码里
+# 绝大多数时候是**数据处理**而不是文件系统操作，因此只在带越界路径字面量时拒绝。
+# 见 _check_call 的说明（2026-09-15 修的真实误拒）。
+_PANDAS_METHOD_NAMES = {"rename", "replace"}
 # 会落盘/读盘的调用名：其**字面量路径参数**不容许越界（绝对/~ /".."）
 FILE_CALL_NAMES = {
     "open", "Path", "read_csv", "read_table", "read_hdf", "read_parquet",
@@ -152,9 +166,14 @@ def _check_call(node: ast.Call) -> None:
         bad_mode = _open_write_mode(node)
         if bad_mode:
             raise SandboxViolation(f"denied: write mode open (mode={bad_mode!r})")
-    if name in DENIED_FILE_METHODS:
+    # 与 pandas 同名的变更方法（rename/replace）只在**带越界字面量路径**时拒绝。
+    # 2026-09-15 实测：无条件按方法名拒绝会把 df.rename("factor") /
+    # df.replace([inf], nan) 这类完全合法的 pandas 惯用法拒掉，标准因子模板
+    # 连静态检查都过不去。真正的逃逸风险来自**路径字面量**，而不是方法名 ——
+    # 相对路径的变更都发生在 job 目录内，本来就被允许。
+    if name in DENIED_FILE_METHODS and name not in _PANDAS_METHOD_NAMES:
         raise SandboxViolation(f"denied: filesystem-mutating call: {name}()")
-    if name in FILE_CALL_NAMES:
+    if name in DENIED_FILE_METHODS or name in FILE_CALL_NAMES:
         candidates = list(node.args) + [k.value for k in node.keywords
                                         if k.arg in _PATH_KWARGS]
         for arg in candidates:

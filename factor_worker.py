@@ -602,13 +602,17 @@ def factor_oos_check(code: str, name: str) -> str:
     try:
         mining = _oos_backtest(code, name, MINING_TEST_START)
         if not mining.get("ok"):
+            # 透传 traceback：因子失败的真实原因（如沙箱内存不足）之前被吞掉，
+            # 只剩一句 "new factor 'x' failed"，完全无法自查（2026-09-15 实测）。
             return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
-                          "error": f"mining-window backtest failed: {mining.get('error', '')}"})
+                          "error": f"mining-window backtest failed: {mining.get('error', '')}",
+                          "traceback": mining.get("traceback", "")})
         oos = _oos_backtest(code, name, OOS_TEST_START)
         if not oos.get("ok"):
             return _json({"oos": {}, "mining": _pick_metrics(mining["metrics"]),
                           "decay": None, "ok": False,
-                          "error": f"oos-window backtest failed: {oos.get('error', '')}"})
+                          "error": f"oos-window backtest failed: {oos.get('error', '')}",
+                          "traceback": oos.get("traceback", "")})
         m_ic = (mining["metrics"] or {}).get("IC")
         o_ic = (oos["metrics"] or {}).get("IC")
         decay = None
