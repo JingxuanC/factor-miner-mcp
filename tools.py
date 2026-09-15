@@ -9,8 +9,9 @@ factors.py / models.py，qlib 相关重依赖全部惰性导入（未装 pyqlib
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
+import panel
 from factors import FactorEngine
 from models import ModelEngine
 
@@ -41,6 +42,31 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
         HANDLERS[name] = fn
         return fn
     return deco
+
+
+# ═══════════════════════════════════════════════════════════════
+# 形状容差参数（统一 panel 契约，见 panel.py）
+#
+# 注解必须是 Any：网关的参数校验基于**函数的类型注解**（mcp_common._ann_type
+# 读 p.annotation），写成 list/dict 会在进入工具函数之前就把另一种形状拒掉 ——
+# 函数体内的 panel 归一化根本没机会执行（2026-09-15 实测踩到：
+# "参数 'klines' 类型错误：期望 array，实际收到 {...}"）。
+# JSON Schema 用 anyOf 如实 advertise 两种形状。
+# ═══════════════════════════════════════════════════════════════
+
+_PANEL_SCHEMA = {
+    "anyOf": [{"type": "array"}, {"type": "object"}],
+    "description": "接受多种等价形状（panel.py 契约）：扁平 bar 数组 "
+                   "[{date,open,high,low,close},...] / {symbol: [bars]} / "
+                   "{columns:[...], rows:[[...]]} 列式面板 / 宽表 {symbol:{date:close}} / "
+                   "长表 [{date,symbol,close}]。单序列工具收到多序列会明确报错。",
+}
+
+_SERIES_LIST_SCHEMA = {
+    "anyOf": [{"type": "array"}, {"type": "object"}],
+    "description": "多序列（panel.py 契约）：原生 [{symbol, klines:[...]}, ...]，"
+                   "也接受 {symbol: [bars]} 或 [[bars], ...]。",
+}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -137,7 +163,8 @@ HANDLERS.setdefault("predict", _predict_handler)
       "MASTER (AAAI 2024 股票专用 Transformer，截面 batch + market-guided gating，torch CPU). "
       "Evaluates IC/rank_ic/sharpe on the validation tail, saves model to disk. "
       "Returns JSON string: {status, model_type, ic, rank_ic, sharpe, n_samples, n_features, model_path, ...}.",
-      {"klines_list": {"type": "array", "description": "[{symbol, klines: [{date,open,high,low,close,volume}, ...]}, ...] (>=62 klines per symbol; master 为截面模型，建议 >=10 只股票)"},
+      {"klines_list": {**_SERIES_LIST_SCHEMA,
+       "description": ">=62 klines per symbol; master 为截面模型，建议 >=10 只股票"},
        "model": {"type": "string", "enum": ["lgbm", "master"], "description": "训练后端（默认 lgbm，向后兼容）", "default": "lgbm"},
        "validation_days": {"type": "integer", "description": "Tail samples for validation (default 20)", "default": 20},
        "early_stopping_rounds": {"type": "integer", "description": "LGBM patience (default 20, 仅 lgbm)", "default": 20},
@@ -149,10 +176,14 @@ HANDLERS.setdefault("predict", _predict_handler)
        "lr": {"type": "number", "description": "MASTER Adam 学习率（默认 3e-4；仅 master）", "default": 0.0003},
        "max_symbols": {"type": "integer", "description": "MASTER 股票数上限校验（默认 50，CPU 保护；仅 master）", "default": 50}},
       required=["klines_list"])
-def ml_train_rolling(klines_list: list, model: str = "lgbm", validation_days: int = 20,
+def ml_train_rolling(klines_list: Any, model: str = "lgbm", validation_days: int = 20,
                      early_stopping_rounds: int = 20, min_history: int = 60, step: int = 1,
                      seq_len: int = 8, epochs: int = 3, d_model: int = 64,
                      lr: float = 3e-4, max_symbols: int = 50) -> str:
+    try:
+        klines_list = panel.as_series_list(klines_list)
+    except panel.PanelError as e:
+        return json.dumps({"error": "klines_list 无法解析: %s" % e})
     from trainer import get_trainer
     trainer = get_trainer()
     if model == "master":
@@ -168,10 +199,15 @@ def ml_train_rolling(klines_list: list, model: str = "lgbm", validation_days: in
       "model='lgbm' (default) prefers Redis factor:{symbol} snapshots, falls back to on-the-fly "
       "factor compute; model='master' 用最近 seq_len 天特征序列出分（需先 model='master' 训练）。 "
       "Returns JSON string: {status, n_predicted, predictions: {symbol: score}}.",
-      {"klines_list": {"type": "array", "description": "[{symbol, klines: [...]}, ...] (klines used when no Redis snapshot; master 至少需 seq_len 根)"},
+      {"klines_list": {**_SERIES_LIST_SCHEMA,
+       "description": "klines used when no Redis snapshot; master 至少需 seq_len 根"},
        "model": {"type": "string", "enum": ["lgbm", "master"], "description": "预测后端（默认 lgbm，向后兼容）", "default": "lgbm"}},
       required=["klines_list"])
-def ml_predict(klines_list: list, model: str = "lgbm") -> str:
+def ml_predict(klines_list: Any, model: str = "lgbm") -> str:
+    try:
+        klines_list = panel.as_series_list(klines_list)
+    except panel.PanelError as e:
+        return json.dumps({"error": "klines_list 无法解析: %s" % e})
     from trainer import get_trainer
     trainer = get_trainer()
     if model == "master":
@@ -197,12 +233,13 @@ def ml_metrics() -> str:
       "dependency): quantile returns per forward period, long-short spread, daily cross-sectional "
       "Spearman IC (mean/IR/decay), top/bottom bucket turnover. "
       "Returns JSON string: {quantile_returns, long_short, ic: {mean, ir, series_summary, decay}, turnover, method}.",
-      {"factor_values": {"type": "array", "description": "[{date, symbol, value}, ...]"},
-       "klines": {"type": "object", "description": "{symbol: [{date, close}, ...]}"},
+      {"factor_values": {**_PANEL_SCHEMA,
+                         "description": "因子值面板，接受多种形状（panel.py 契约）；原生 [{date, symbol, value}, ...]"},
+       "klines": _PANEL_SCHEMA,
        "quantiles": {"type": "integer", "description": "Number of quantile buckets (default 5)", "default": 5},
        "periods": {"type": "array", "description": "Forward return periods in days (default [1,5,10])", "default": [1, 5, 10]}},
       required=["factor_values", "klines"])
-def factor_tearsheet(factor_values: list, klines: dict, quantiles: int = 5,
+def factor_tearsheet(factor_values: Any, klines: Any, quantiles: int = 5,
                      periods: Optional[list] = None) -> str:
     import analytics
     return analytics.factor_tearsheet(factor_values, klines, quantiles, periods)
@@ -213,11 +250,11 @@ def factor_tearsheet(factor_values: list, klines: dict, quantiles: int = 5,
       "mean_variance via pypfopt when installed (lazy import). "
       "Returns JSON string: {weights, expected_return, volatility, sharpe, method}.",
       {"symbols": {"type": "array", "description": "Symbols to allocate"},
-       "klines": {"type": "object", "description": "{symbol: [{date, close}, ...]}"},
+       "klines": _PANEL_SCHEMA,
        "method": {"type": "string", "enum": ["hrp", "equal", "min_variance", "mean_variance"], "default": "hrp"},
        "lookback": {"type": "integer", "description": "Estimation window in days (default 120)", "default": 120}},
       required=["symbols", "klines"])
-def portfolio_optimize(symbols: list, klines: dict, method: str = "hrp",
+def portfolio_optimize(symbols: list, klines: Any, method: str = "hrp",
                        lookback: int = 120) -> str:
     import analytics
     return analytics.portfolio_optimize(symbols, klines, method, lookback)
@@ -227,10 +264,10 @@ def portfolio_optimize(symbols: list, klines: dict, method: str = "hrp",
       "(20d momentum + realized vol thresholds); GaussianHMM (ret+vol features) via hmmlearn "
       "when installed (lazy import). Returns JSON string: "
       "{current_regime, regime_history, regime_stats, method}.",
-      {"klines": {"type": "array", "description": "[{date, close, volume?}, ...] (index or single stock)"},
+      {"klines": _PANEL_SCHEMA,
        "n_regimes": {"type": "integer", "description": "2 (bull/bear) or 3 (+range), default 3", "default": 3}},
       required=["klines"])
-def regime_detect(klines: list, n_regimes: int = 3) -> str:
+def regime_detect(klines: Any, n_regimes: int = 3) -> str:
     import analytics
     return analytics.regime_detect(klines, n_regimes)
 
@@ -238,11 +275,11 @@ def regime_detect(klines: list, n_regimes: int = 3) -> str:
 @tool("change_point", "Structural change-point detection: built-in CUSUM (Page 1954) + binary "
       "segmentation on mean shifts; PELT (Killick 2012) via ruptures when installed (lazy import). "
       "Returns JSON string: {change_points: [{date, index, significance}], method}.",
-      {"series": {"type": "array", "description": "[{date, value}, ...]"},
+      {"series": _PANEL_SCHEMA,
        "method": {"type": "string", "enum": ["auto", "cusum_binseg", "pelt"], "default": "auto"},
        "max_bkps": {"type": "integer", "description": "Max breakpoints (default 5)", "default": 5}},
       required=["series"])
-def change_point(series: list, method: str = "auto", max_bkps: int = 5) -> str:
+def change_point(series: Any, method: str = "auto", max_bkps: int = 5) -> str:
     import analytics
     return analytics.change_point(series, method, max_bkps)
 
@@ -251,11 +288,11 @@ def change_point(series: list, method: str = "auto", max_bkps: int = 5) -> str:
       "multi-day extrapolation) + Parkinson high/low reference when OHLC given; GARCH(1,1) via "
       "arch when installed (lazy import). Returns JSON string: "
       "{forecast: [{day, vol}], current_vol, method} (daily vol as decimal).",
-      {"klines": {"type": "array", "description": "[{date, close, high?, low?}, ...]"},
+      {"klines": _PANEL_SCHEMA,
        "horizon": {"type": "integer", "description": "Forecast days ahead (default 5)", "default": 5},
        "method": {"type": "string", "enum": ["auto", "ewma", "garch"], "default": "auto"}},
       required=["klines"])
-def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
+def vol_forecast(klines: Any, horizon: int = 5, method: str = "auto") -> str:
     import analytics
     return analytics.vol_forecast(klines, horizon, method)
 
@@ -299,3 +336,13 @@ EXTRA_SCHEMAS = {
                 "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}, "factors": {"type": "object"}},
                                 "required": []}},
 }
+
+
+# 形状容差参数清单：(工具名, 参数名) —— 供测试钉住网关层的注解放宽。
+# 这些参数的注解必须是 Any，见 panel.py 与 mcp_common._ann_type。
+SHAPE_TOLERANT_ARGS = [
+    ("factor_tearsheet", "klines"), ("factor_tearsheet", "factor_values"),
+    ("portfolio_optimize", "klines"), ("regime_detect", "klines"),
+    ("change_point", "series"), ("vol_forecast", "klines"),
+    ("ml_predict", "klines_list"), ("ml_train_rolling", "klines_list"),
+]

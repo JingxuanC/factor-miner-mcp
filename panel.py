@@ -52,6 +52,7 @@ __all__ = [
     "as_matrix",
     "as_matrix_frame",
     "as_features",
+    "as_series_list",
     "detect_shape",
     "present_fields",
     "is_flat_bars",
@@ -495,6 +496,48 @@ def as_matrix(obj: Any, value: str = "close", with_dates: bool = False):
         dates = [pd.Timestamp(i).strftime("%Y-%m-%d") for i in wide.index]
         return cols, rows, dates
     return cols, rows
+
+
+def as_series_list(obj: Any, symbol_key: str = "symbol",
+                   klines_key: str = "klines") -> list:
+    """→ 原生多序列形态 ``[{symbol, klines: [bars]}, ...]``。
+
+    这是 ``ml_train_rolling`` / ``ml_predict`` / kronos ``forecast_batch``
+    的原生入参。接受三种等价写法：
+
+    - 原生 ``[{symbol?, klines: [bars]}, ...]``
+    - ``{symbol: [bars]}``（keyed bars，最常见的写法）
+    - ``[[bars], ...]``（无标的名的纯列表）
+
+    每个序列内部都会过 :func:`as_bars`，因此序列本身也可以是多形态的。
+    空输入返回 ``[]``（``ml_predict`` 允许空列表走 Redis 因子里程碑）。
+    """
+    items: list = []
+    if obj is None:
+        return []
+    if isinstance(obj, dict):
+        items = [{symbol_key: str(k), klines_key: v} for k, v in obj.items()]
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            if isinstance(v, dict) and isinstance(v.get(klines_key), (list, tuple, dict)):
+                items.append({
+                    symbol_key: str(v.get(symbol_key) or "series-%d" % i),
+                    klines_key: v[klines_key],
+                })
+            else:
+                items.append({symbol_key: "series-%d" % i, klines_key: v})
+    else:
+        raise PanelError("多序列入参必须是 list 或 dict：%s" % _shape_of(obj))
+
+    out = []
+    for it in items:
+        sym = it[symbol_key]
+        try:
+            bars = as_bars(it[klines_key], default_symbol=sym)
+        except PanelError as e:
+            raise PanelError("%s 的序列无法解析: %s" % (sym, e))
+        out.append({symbol_key: sym, klines_key: bars})
+    return out
 
 
 def as_features(obj: Any, default_symbol: str = "asset") -> dict:
