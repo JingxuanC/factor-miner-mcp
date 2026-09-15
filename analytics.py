@@ -29,6 +29,8 @@ import json
 
 import numpy as np
 import pandas as pd
+
+import panel
 from scipy import stats
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import squareform
@@ -40,27 +42,26 @@ TRADING_DAYS = 252
 # 公共工具
 # ═══════════════════════════════════════════════════════════════
 
-def _klines_to_close_frame(klines: dict) -> pd.DataFrame:
-    """{symbol: [{date, close}, ...]} → DataFrame(index=date, columns=symbol)。"""
-    frames = {}
-    for symbol, rows in (klines or {}).items():
-        if not rows:
-            continue
-        df = pd.DataFrame(rows)
-        if "date" not in df or "close" not in df:
-            continue
-        frames[symbol] = df.set_index("date")["close"].astype(float)
-    if not frames:
-        return pd.DataFrame()
-    px = pd.DataFrame(frames).sort_index()
-    return px.ffill()
+def _klines_to_close_frame(klines) -> pd.DataFrame:
+    """任意 panel 受支持形状 → DataFrame(index=date, columns=symbol)。
+
+    2026-09-15 起归一化交给 panel 契约：不再只接受 ``{symbol: [{date, close}]}``，
+    扁平 bar 列表 / 列式 panel / 宽表 / 长表同样可用。形状无法解析时抛
+    :class:`panel.PanelError`，由调用方转成带形状信息的错误 JSON。
+    """
+    return panel.as_close_frame(klines)
 
 
-def _klines_to_series(klines: list, key: str = "close") -> pd.Series:
-    df = pd.DataFrame(klines or [])
-    if df.empty or "date" not in df or key not in df:
+def _klines_to_series(klines, key: str = "close") -> pd.Series:
+    """任意 panel 受支持形状 → 单序列 ``pd.Series``（index=date）。
+
+    多序列输入会抛 ``PanelError`` —— 单序列工具收到多序列时应当报错，
+    而不是静默取第一列。
+    """
+    rows = panel.as_series(klines, key=key)
+    if not rows:
         return pd.Series(dtype=float)
-    return df.set_index("date")[key].astype(float).sort_index()
+    return pd.Series({r["date"]: r["value"] for r in rows}).sort_index().astype(float)
 
 
 def _nan_safe(obj):
@@ -86,12 +87,18 @@ def factor_tearsheet(factor_values: list, klines: dict,
     periods = [int(p) for p in (periods or [1, 5, 10])]
     quantiles = max(2, int(quantiles))
 
-    fdf = pd.DataFrame(factor_values or [])
-    if fdf.empty or not {"date", "symbol", "value"} <= set(fdf.columns):
+    try:
+        fdf = panel.as_dataframe(factor_values or [])
+    except panel.PanelError as e:
+        return json.dumps({"error": "factor_values 无法解析: %s" % e})
+    if fdf.empty or not {"date", "symbol", "close"} <= set(fdf.columns):
         return json.dumps({"error": "factor_values 需含 date/symbol/value"})
-    fac = fdf.pivot_table(index="date", columns="symbol", values="value").sort_index()
+    fac = fdf.pivot_table(index="date", columns="symbol", values="close").sort_index()
 
-    px = _klines_to_close_frame(klines)
+    try:
+        px = _klines_to_close_frame(klines)
+    except panel.PanelError as e:
+        return json.dumps({"error": "klines 无法解析: %s" % e})
     if px.empty:
         return json.dumps({"error": "klines 为空或缺 date/close"})
     # 对齐：只保留因子与价格都有的日期/标的
@@ -100,6 +107,14 @@ def factor_tearsheet(factor_values: list, klines: dict,
     fac, px = fac.loc[idx, cols], px.loc[idx, cols]
     if len(idx) < max(periods) + 2:
         return json.dumps({"error": "对齐后样本不足"})
+    # 截面标的数不够 quantiles 分位时，qcut 会整体跳过、分位收益全是 None ——
+    # 那是「成功返回一堆 null」的静默失败，必须显式报错（2026-09-15 实测：
+    # 8 个标的 + quantiles=5 时 quantile_returns 里全是 None 却无 error）。
+    if fac.shape[1] < quantiles * 2:
+        return json.dumps({
+            "error": "截面标的数不足：每期需 >= %d 个（quantiles*2=%d），实际 %d 个"
+                     % (quantiles * 2, quantiles * 2, fac.shape[1])
+        })
 
     quantile_returns = {}
     long_short = {}
@@ -232,9 +247,16 @@ def _hrp_weights(cov: pd.DataFrame) -> pd.Series:
 def portfolio_optimize(symbols: list, klines: dict, method: str = "hrp",
                        lookback: int = 120) -> str:
     method = (method or "hrp").lower()
-    px = _klines_to_close_frame({s: (klines or {}).get(s, []) for s in symbols})
-    if px.empty:
-        px = _klines_to_close_frame(klines)
+    try:
+        px_all = _klines_to_close_frame(klines)
+    except panel.PanelError as e:
+        return json.dumps({"error": "klines 无法解析: %s" % e})
+    if symbols:
+        want = {str(s) for s in symbols}
+        keep = [c for c in px_all.columns if str(c) in want]
+        px = px_all[keep] if keep else px_all
+    else:
+        px = px_all
     px = px.dropna(axis=1, how="all").tail(int(lookback) + 1)
     rets = px.pct_change().dropna(how="any")
     if rets.shape[0] < 20 or rets.shape[1] < 2:
@@ -310,7 +332,10 @@ def _label_states(order_stats: dict, n_regimes: int) -> dict:
 
 def regime_detect(klines: list, n_regimes: int = 3) -> str:
     n_regimes = max(2, min(3, int(n_regimes)))
-    close = _klines_to_series(klines, "close")
+    try:
+        close = _klines_to_series(klines, "close")
+    except panel.PanelError as e:
+        return json.dumps({"error": "klines 无法解析: %s" % e})
     if len(close) < 40:
         return json.dumps({"error": "K线不足（需 >=40 根）"})
     ret = close.pct_change()
@@ -432,8 +457,11 @@ def _cusum_binseg(x: np.ndarray, max_bkps: int, min_len: int = 10):
 
 
 def change_point(series: list, method: str = "auto", max_bkps: int = 5) -> str:
-    df = pd.DataFrame(series or [])
-    if df.empty or not {"date", "value"} <= set(df.columns):
+    try:
+        df = pd.DataFrame(panel.as_series(series, key="close"))
+    except panel.PanelError as e:
+        return json.dumps({"error": "series 无法解析: %s" % e})
+    if df.empty:
         return json.dumps({"error": "series 需含 date/value"})
     df = df.sort_values("date").reset_index(drop=True)
     x = df["value"].astype(float).values
@@ -483,7 +511,10 @@ def change_point(series: list, method: str = "auto", max_bkps: int = 5) -> str:
 
 def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
     horizon = max(1, int(horizon))
-    close = _klines_to_series(klines, "close")
+    try:
+        close = _klines_to_series(klines, "close")
+    except panel.PanelError as e:
+        return json.dumps({"error": "klines 无法解析: %s" % e})
     if len(close) < 30:
         return json.dumps({"error": "K线不足（需 >=30 根）"})
     ret = close.pct_change().dropna()
@@ -519,11 +550,23 @@ def vol_forecast(klines: list, horizon: int = 5, method: str = "auto") -> str:
         "current_vol": forecast[0],
         "method": used,
     }
-    # 输入含 high/low 时附 Parkinson (1980) 当前波动率参考
-    df = pd.DataFrame(klines)
-    if {"high", "low"} <= set(df.columns):
-        hl = np.log(df["high"].astype(float) / df["low"].astype(float)) ** 2
-        out["parkinson_vol"] = float(np.sqrt(hl.tail(20).mean()
-                                             / (4 * np.log(2))
-                                             * TRADING_DAYS))
+    # 输入**真实**含 high/low 时附 Parkinson (1980) 波动率参考。
+    # 必须问 panel.present_fields，而不是看归一化后的列：归一化会用 close 补齐
+    # high/low，直接算会得到 log(1)²=0 的假零波动率。
+    # 也绝不能对原始 klines 再调一次 pd.DataFrame —— 那会绕过归一化，在
+    # columnar 等形状上抛未捕获的 pandas 异常（2026-09-15 实测到的真实故障）。
+    if {"high", "low"} <= panel.present_fields(klines):
+        bars = pd.DataFrame()
+        try:
+            bars = panel.as_dataframe(klines)
+        except panel.PanelError:
+            bars = pd.DataFrame()
+        if not bars.empty:
+            ok = (bars["low"].astype(float) > 0) & (bars["high"].astype(float) > 0)
+            if ok.any():
+                hl = np.log(bars.loc[ok, "high"].astype(float)
+                            / bars.loc[ok, "low"].astype(float)) ** 2
+                out["parkinson_vol"] = float(np.sqrt(hl.tail(20).mean()
+                                                     / (4 * np.log(2))
+                                                     * TRADING_DAYS))
     return json.dumps(_nan_safe(out), ensure_ascii=False)
