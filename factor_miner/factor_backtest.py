@@ -23,7 +23,10 @@ smoke profile（CI/联调）：30 股 × 2019 一年 × num_threads 2 × leaves 
   - scenarios/qlib/developer/factor_runner.py（拼接/去重/parquet 写入）
   - scenarios/qlib/experiment/factor_template/read_exp_res.py（recorder 解析）
   - utils/qlib.py ALPHA20（基线特征表达式）
-qlib/mlflow/jinja2 均延迟导入，未装 pyqlib 的环境可 import 本模块。
+qlib/mlflow 延迟导入，未装 pyqlib 的环境可 import 本模块；但 **jinja2 是硬依赖**
+—— _render_conf 用它预渲染 conf 模板，与 qlib 无关，所以它在 requirements.txt 里
+常装（曾经只在 Dockerfile 的 qlib 分支装，aarch64 跳过 qlib 时 factor_oos_check
+就死在 ModuleNotFoundError 上）。
 
 用法:
   python -m factor_miner.factor_backtest --new mom20 factor.py \

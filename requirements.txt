@@ -17,6 +17,12 @@ lightgbm>=4.3
 # CPU index-url / wheels/ 离线包单独装一层以控制体积（此处仅作版本声明，
 # 镜像内 pip 看到已装即跳过）
 torch>=2.2
+# conf 模板预渲染（factor_oos_check / factor_backtest 的 _render_conf）。
+# 必须在这里，不能只在 Dockerfile 的 qlib 分支里装：渲染 conf 不需要 qlib，
+# 而 aarch64 上 WITH_QLIB=auto 会跳过整个 qlib 分支，于是 jinja2 也没了——
+# factor_oos_check 就在 _render_windows_conf 里 ModuleNotFoundError 挂掉。
+# 纯 Python 包，几百 KB，无编译依赖。
+jinja2>=3.1
 # ── 可选：因子评估与组合分析增强（缺库时自动回退内置实现，不阻塞）──
 # PyPortfolioOpt>=1.5  # portfolio_optimize method="mean_variance"（注意 PyPI 包名）
 # hmmlearn>=0.3        # regime_detect 走 GaussianHMM
