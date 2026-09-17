@@ -454,12 +454,28 @@ def stage_h5_for_sandbox(data_h5: Path, job_dir: Path, window_days: int) -> Path
     return dst
 
 
-def _run_factor_df(code: str, data_h5: Path,
-                   window_days: int | None = None) -> pd.DataFrame:
-    """沙箱执行单个 factor.py 并读回 (datetime, instrument) 归一化 DataFrame。
+def _run_factor_window(code: str, data_h5: Path,
+                       window_days: int | None = None) -> tuple[pd.Series, pd.Series]:
+    """在**同一个**窗口切片上跑 factor.py，并把该切片的收盘价一并交回。
 
-    ``window_days`` 缺省用 ``WINDOW_DAYS``（默认 400 交易日）；见该常量的说明 ——
-    全量 h5 会撑爆沙箱 RLIMIT_AS。
+    返回 ``(factor_series, close_series)``，两者同为 (datetime, instrument) 索引。
+
+    存在的理由是一次全量读取代两次。``daily_pv_all.h5`` 是 pandas 的 Fixed
+    格式（PyTables 里是 ``block0_values`` 数组、没有 table），所以**无法按列或
+    按行部分读**——实测 ``columns=['$close']`` 直接 TypeError，只能整表读入，
+    一次 ~710MiB / ~27s。
+
+    ``factor_recent_ic`` 需要两样东西：因子值（来自跑完的 result.h5）和收盘价
+    （算次日收益）。原先它先让 ``_run_factor_df`` 整读一次全量去暂存窗口，再
+    自己整读第二次去取收盘价——峰值因此叠到 ~1375MiB，在 1536MiB 的容器上限
+    下把整个服务 OOM 掉（内核 memcg 击杀，容器重启）。
+
+    切片的收盘价与"整读全量再取 ``$close``"**逐值相同**：切片就是该窗口的行
+    子集，这里再按索引排序，与全量读的顺序一致。所以既省掉一次 710MiB 的整
+    读，又不改变数值口径。
+
+    job_dir 不返回：它留在 JOBS_ROOT 由 ``cleanup_stale_dirs`` 按 TTL 回收，
+    与改动前一致。
     """
     job_dir = JOBS_ROOT / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -473,7 +489,24 @@ def _run_factor_df(code: str, data_h5: Path,
         if res.timed_out:
             detail = f"[sandbox timeout {EXEC_TIMEOUT}s]\n" + detail
         raise RuntimeError(detail)
-    return fb._read_result_h5(job_dir)
+
+    factor = fb._read_result_h5(job_dir).iloc[:, 0].rename("factor")
+    staged = pd.read_hdf(job_dir / "daily_pv.h5", key="data").sort_index()
+    close = staged["$close"].rename("close")
+    del staged
+    return factor, close
+
+
+def _run_factor_df(code: str, data_h5: Path,
+                   window_days: int | None = None) -> pd.DataFrame:
+    """沙箱执行单个 factor.py 并读回 (datetime, instrument) 归一化 DataFrame。
+
+    ``window_days`` 缺省用 ``WINDOW_DAYS``（默认 400 交易日）；见该常量的说明 ——
+    全量 h5 会撑爆沙箱 RLIMIT_AS。
+    """
+    factor, close = _run_factor_window(code, data_h5, window_days)
+    del close  # 调用方只要因子值；少留一份切片在内存里
+    return factor.to_frame("factor")
 
 
 def latest_row_per_instrument(df: pd.DataFrame) -> dict:
@@ -637,19 +670,23 @@ def factor_recent_ic(code: str, name: str,
     （因子值 vs 次日收益），纯 pandas 不走 qlib——周频跑全库成本必须低。
 
     返回 JSON: {ok, ic, days, error}。数据不足（<10 个交易日）记 error。
+
+    内存口径见 ``_run_factor_window``：整读一次全量（Fixed 格式无法部分读），
+    因子值和收盘价都取自同一次暂存，不再整读第二遍。此前两次整读把峰值叠到
+    ~1375MiB，在 1536MiB 的容器上限下会触发内核 memcg OOM，把整个服务打死。
     """
     try:
         data_h5 = DATA_DIR / "daily_pv_all.h5"
         if not data_h5.exists():
             return _json({"ok": False, "ic": None, "days": 0,
                           "error": f"data file missing: {data_h5}"})
-        fac = _run_factor_df(code, data_h5).iloc[:, 0].rename("factor")
-        pv = pd.read_hdf(data_h5, key="data")
-        close = pv["$close"].rename("close")
+        fac, close = _run_factor_window(code, data_h5)
         # 次日收益（T+1 开盘不可得的近似：close→close），与挖掘 label 口径同族
         ret1 = close.groupby(level="instrument").pct_change().groupby(
             level="instrument").shift(-1).rename("ret")
+        del close
         pair = pd.concat([fac, ret1], axis=1).dropna()
+        del fac, ret1
         if pair.empty:
             return _json({"ok": False, "ic": None, "days": 0,
                           "error": "no overlapping factor/return data"})
