@@ -373,6 +373,7 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
             exec_cache=exec_cache,
             profile=profile,
             version=version,  # 复用本函数已算的数据版本，避免重复计算
+            execute=_executor_dispatch(work_dir, version),
         )
         _write_back_cache(sota_srcs + [new_src], version, work_dir)
         correlations[new_src.name] = _correlations(new_src, sota_srcs, version, work_dir)
@@ -403,6 +404,37 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
         "error": error,
         "traceback": last_tb,
     }
+
+
+def _executor_dispatch(work_dir: Path, version: str | None):
+    """把 qrun 交给远程执行器跑；未配置执行器时返回 None（走本地执行）。
+
+    为什么要拆出去：qrun 是全市场 LGBM 训练，内存是 GB 级，而本容器被限制在
+    1536 MiB。实测后果是内核 memcg 直接 OOM 掉**整个 miner 容器**，并且失败的
+    qrun 会变孤儿进程继续占内存、把容器卡死到只能重启。
+
+    只搬「执行」这一步：Step 1–3（沙箱跑因子、去重闸门、拼 combined_factors）
+    留在本地，它们本来就是轻的，而且依赖面板归一化与 exec_cache。
+
+    conf 现在是**本地渲染好再传**的（`fb._render_conf` 已把 provider_uri 渲染进去）。
+    远程模式下 `_render_conf` 仍用模板里的 provider_uri —— 所以执行器与本地必须
+    看到同一份 qlib 数据；这由启动时的版本校验兜底（见 client/data_version）。
+    """
+    url = os.environ.get("FACTOR_EXECUTOR_URL", "").strip()
+    if not url:
+        return None
+
+    def execute(work: Path, conf_path: Path, timeout: int, ver: str | None) -> dict:
+        from factor_executor import client as executor_client
+
+        try:
+            return executor_client.run_backtest(work, data_version=ver,
+                                                deadline=time.time() + timeout + 120)
+        except executor_client.ExecutorError as exc:
+            # 执行器侧的问题不该伪装成"因子有问题"：以回测失败返回，但把原因写清
+            return {"ok": False, "error": f"executor error: {exc}"}
+
+    return execute
 
 
 def factor_backtest(sota: list, new_factors: list, profile: str = "full",

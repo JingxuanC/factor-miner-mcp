@@ -367,12 +367,18 @@ def run_backtest(
     profile: str = "full",
     factor_timeout: int = sandbox.DEFAULT_TIMEOUT_SECONDS,
     n_proc: int = 4,
-    version: "str | None" = None,
+    version: str | None = None,
+    execute: Callable[[Path, Path, int, str | None], dict] | None = None,
 ) -> BacktestResult:
     """跑一轮 qlib 回测。失败语义见模块 docstring。
 
     version：exec_cache 的数据版本；调用方（factor_worker）已算过就传进来，
     避免同一回测把数据版本算两次（旧版这里会重复 hash 整份 h5）。
+
+    execute：第 4 步「执行」的注入点。None = 本地起 qrun（默认，与历史行为一致）；
+    传入可调用对象则交给它 —— factor_executor 就是用它把 qrun 搬到独立进程/机器上。
+    签名 `(work_dir, conf_path, timeout, version) -> dict`，返回统一 outcome
+    （成功 `{ok: True, metrics, net_values, trades}`，失败 `{ok: False, error, traceback}`）。
     """
     work_dir = Path(work_dir)
     data_h5 = Path(data_h5)
@@ -445,9 +451,40 @@ def run_backtest(
     combined = combined.loc[:, ~combined.columns.duplicated(keep="last")]
     combined.to_hdf(work_dir / "combined_factors_df.h5", key="data")
 
-    # ── Step 4: 渲染 conf → qrun → 解析 ──
+    # ── Step 4: 渲染 conf → 执行 → 解析 ──
+    #
+    # 「执行」这一步可注入：默认在本地起 qrun，也可以交给远程执行器（见
+    # factor_executor/）。拆出去的理由是资源隔离，不是逻辑差异 —— 因此两边必须
+    # 产出同一套 (metrics, net_values, trades)，否则同一个因子在本地与远程会给出
+    # 不同指标，而这种分叉几乎不可能被发现。
     conf_path = work_dir / "conf.yaml"
     _render_conf(Path(conf_template), conf_path, profile)
+    if execute is None:
+        outcome = execute_local(work_dir, timeout)
+    else:
+        outcome = execute(work_dir, conf_path, timeout, version)
+    if not outcome.get("ok"):
+        return BacktestResult(
+            ok=False,
+            sota_broken=sota_broken,
+            error=str(outcome.get("error") or "backtest failed"),
+            traceback=str(outcome.get("traceback") or ""),
+        )
+    metrics = outcome.get("metrics") or {}
+    net_values = outcome.get("net_values") or []
+    trades = outcome.get("trades") or []
+    return BacktestResult(
+        ok=True, sota_broken=sota_broken, metrics=metrics, net_values=net_values, trades=trades
+    )
+
+
+def execute_local(work_dir: Path, timeout: int = DEFAULT_TIMEOUT) -> dict:
+    """在**本进程所在容器**里执行 qrun 并解析 —— 注入点的默认实现。
+
+    返回统一的 outcome dict：成功 `{ok: True, metrics, net_values, trades}`，
+    失败 `{ok: False, error, traceback}`。远程执行器返回同一个形状，调用方无分支。
+    """
+    conf_path = work_dir / "conf.yaml"
     try:
         proc = subprocess.run(
             ["qrun", str(conf_path)],
@@ -455,38 +492,34 @@ def run_backtest(
             capture_output=True,
             text=True,
             timeout=timeout,
+            check=False,   # 自己判 returncode 并翻译成 outcome，不需要 run() 抛异常
             # qrun 子进程同样上 rlimit（仅 RLIMIT_FSIZE，见 sandbox.qrun_preexec：
             # RLIMIT_AS/CPU 会杀掉多线程全量回测，故不复用 _apply_limits）
             preexec_fn=sandbox.qrun_preexec(),
         )
     except subprocess.TimeoutExpired as e:
-        return BacktestResult(
-            ok=False,
-            sota_broken=sota_broken,
-            error=f"qrun timeout {timeout}s",
-            traceback=(e.stderr or "") if isinstance(e.stderr, str) else "",
-        )
+        return {
+            "ok": False,
+            "error": f"qrun timeout {timeout}s",
+            "traceback": (e.stderr or "") if isinstance(e.stderr, str) else "",
+        }
     except FileNotFoundError:
-        return BacktestResult(ok=False, sota_broken=sota_broken, error="qrun not found on PATH")
+        return {"ok": False, "error": "qrun not found on PATH"}
     if proc.returncode != 0:
-        return BacktestResult(
-            ok=False,
-            sota_broken=sota_broken,
-            error=f"qrun exit {proc.returncode}",
-            traceback=proc.stderr[-4000:] if proc.stderr else proc.stdout[-4000:],
-        )
+        return {
+            "ok": False,
+            "error": f"qrun exit {proc.returncode}",
+            "traceback": proc.stderr[-4000:] if proc.stderr else proc.stdout[-4000:],
+        }
     try:
         metrics, net_values, trades = read_exp_res(work_dir)
     except Exception:  # noqa: BLE001
-        return BacktestResult(
-            ok=False,
-            sota_broken=sota_broken,
-            error="failed to parse qrun output",
-            traceback=tb_module.format_exc(),
-        )
-    return BacktestResult(
-        ok=True, sota_broken=sota_broken, metrics=metrics, net_values=net_values, trades=trades
-    )
+        return {
+            "ok": False,
+            "error": "failed to parse qrun output",
+            "traceback": tb_module.format_exc(),
+        }
+    return {"ok": True, "metrics": metrics, "net_values": net_values, "trades": trades}
 
 
 def _load_factor_src(name: str, path: str) -> FactorSrc:
