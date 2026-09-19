@@ -143,6 +143,47 @@ def test_factor_recent_ic_does_not_read_the_full_file_twice(data_root):
     assert out["days"] >= 10, out
 
 
+def test_recent_ic_returns_a_usable_daily_series(data_root):
+    """逐日 IC 序列的端到端契约（看板画衰减曲线就靠它）。
+
+    这条只有镜像里能跑（要 pytables 读 h5）。断言的是**调用方真正依赖的**几件事，
+    而不是内部实现细节：
+
+      - series 是 list，且每个点都有 date/ic
+      - 日期是 ISO（看板要拿它跟行情日期对齐）
+      - 日期唯一且升序（时间轴上不能回折）
+      - 点数与 days 一致，且这些点的均值等于标量 ic
+        （同一个 groupby 的两个视图，分开算就说明有一边错了）
+      - n 是当日有效样本数，为正整数
+    """
+    import datetime as _dt
+
+    data_dir, saved = _setup(data_root)
+    try:
+        out = json.loads(fw.factor_recent_ic(FACTOR_CODE, "t", lookback_days=60))
+        assert out["ok"] is True, out
+
+        series = out["series"]
+        assert isinstance(series, list) and series, out
+        assert len(series) == out["days"], (len(series), out["days"])
+
+        dates = [p["date"] for p in series]
+        assert len(dates) == len(set(dates)), f"日期重复：{dates}"
+        assert dates == sorted(dates), "日期必须升序"
+        for d in dates:
+            _dt.date.fromisoformat(d)  # 非法 ISO 会抛
+
+        for p in series:
+            assert isinstance(p["ic"], float), p
+            assert isinstance(p["n"], int) and p["n"] > 0, p
+
+        # 逐日序列的均值必须与标量 ic 一致 —— 两者来自同一个 groupby
+        mean_of_series = sum(p["ic"] for p in series) / len(series)
+        assert abs(mean_of_series - out["ic"]) < 1e-9, (mean_of_series, out["ic"])
+    finally:
+        _restore(saved)
+
+
 if __name__ == "__main__":
     # 自带 runner：镜像里没有 pytest，而 pytables 只在镜像里。
     #   docker run --rm -v $PWD:/app -w /app factor-miner-mcp:latest \
@@ -153,7 +194,8 @@ if __name__ == "__main__":
 
     failures = 0
     for fn in (test_staged_close_matches_full_panel_window,
-               test_factor_recent_ic_does_not_read_the_full_file_twice):
+               test_factor_recent_ic_does_not_read_the_full_file_twice,
+               test_recent_ic_returns_a_usable_daily_series):
         with tempfile.TemporaryDirectory() as td:
             try:
                 fn(pathlib.Path(td))

@@ -150,8 +150,8 @@ def test_eval_periods_normalized():
 
 # ═══════════════ 2. 端到端：代码 → 专业指标 ═══════════════
 
-def test_factor_evaluate_returns_professional_metrics(tmp: Path):
-    with _Env(tmp):
+def test_factor_evaluate_returns_professional_metrics(tmp_path: Path):
+    with _Env(tmp_path):
         out = json.loads(fw.factor_evaluate("factor.py 内容", hypothesis="动量：强者恒强"))
 
     assert out["ok"] is True, out
@@ -174,9 +174,9 @@ def test_factor_evaluate_returns_professional_metrics(tmp: Path):
     assert out["ic_t_stat"] is not None and out["ic_t_stat"] > 0
 
 
-def test_factor_evaluate_flags_missing_hypothesis_but_still_measures(tmp: Path):
+def test_factor_evaluate_flags_missing_hypothesis_but_still_measures(tmp_path: Path):
     """假设缺失只标记、不拦评估：必填是入库闸门，不是评估闸门。"""
-    with _Env(tmp):
+    with _Env(tmp_path):
         out = json.loads(fw.factor_evaluate("factor.py 内容", hypothesis="  "))
 
     assert out["ok"] is True
@@ -186,45 +186,45 @@ def test_factor_evaluate_flags_missing_hypothesis_but_still_measures(tmp: Path):
     assert out["tearsheet"]["ic"]["mean"] is not None
 
 
-def test_factor_evaluate_debug_dataset_uses_full_history(tmp: Path):
+def test_factor_evaluate_debug_dataset_uses_full_history(tmp_path: Path):
     """debug 集很小，窗口必须为 0（全量）——否则调试集被截到没几天。"""
-    with _Env(tmp):
+    with _Env(tmp_path):
         out = json.loads(fw.factor_evaluate("factor.py 内容", dataset="debug"))
     assert out["ok"] is True and out["dataset"] == "debug" and out["window_days"] == 0
 
 
 # ═══════════════ 3. 失败路径：永不抛异常 ═══════════════
 
-def test_factor_evaluate_missing_data_file(tmp: Path):
-    with _Env(tmp):
-        (tmp / "daily_pv_all.h5").unlink()
+def test_factor_evaluate_missing_data_file(tmp_path: Path):
+    with _Env(tmp_path):
+        (tmp_path / "daily_pv_all.h5").unlink()
         out = json.loads(fw.factor_evaluate("factor.py 内容"))
     assert out["ok"] is False and "data file missing" in out["error"]
     assert out["tearsheet"] is None
 
 
-def test_factor_evaluate_sandbox_failure_is_reported_not_raised(tmp: Path):
+def test_factor_evaluate_sandbox_failure_is_reported_not_raised(tmp_path: Path):
     """沙箱失败（白名单违规/超时/非零退出）必须连原因一起回，不能吞。"""
-    with _Env(tmp, raise_exc=RuntimeError("whitelist violation: os")):
+    with _Env(tmp_path, raise_exc=RuntimeError("whitelist violation: os")):
         out = json.loads(fw.factor_evaluate("import os"))
     assert out["ok"] is False
     assert "whitelist violation: os" in out["error"]
     assert out["traceback"] and "RuntimeError" in out["traceback"]
 
 
-def test_factor_evaluate_passes_through_tearsheet_error(tmp: Path):
+def test_factor_evaluate_passes_through_tearsheet_error(tmp_path: Path):
     """样本不足时 tearsheet 走 error 分支 —— 原因要透传，不能变成“评估失败”。"""
-    with _Env(tmp, fake=lambda: _synthetic(n_dates=3, n_inst=12)):
+    with _Env(tmp_path, fake=lambda: _synthetic(n_dates=3, n_inst=12)):
         out = json.loads(fw.factor_evaluate("factor.py 内容"))
     assert out["ok"] is False
     assert "样本不足" in out["error"] or "不足" in out["error"]
     assert out["error"] != "factor_evaluate worker exception"
 
 
-def test_factor_evaluate_worker_exception_is_json(tmp: Path):
+def test_factor_evaluate_worker_exception_is_json(tmp_path: Path):
     """连内部异常也要落成 JSON（tool 通道不接受抛异常）。"""
     garbage = lambda: (object(), object())  # noqa: E731 — 沙箱"成功"但返回值不是 Series
-    with _Env(tmp, fake=garbage):
+    with _Env(tmp_path, fake=garbage):
         out = json.loads(fw.factor_evaluate("factor.py 内容"))
     assert out["ok"] is False and out["error"] == "factor_evaluate worker exception"
     assert "AttributeError" in out["traceback"]

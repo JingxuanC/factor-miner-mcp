@@ -28,6 +28,7 @@ import traceback as tb_module
 import uuid
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from factor_miner import factor_backtest as fb
@@ -698,12 +699,51 @@ def factor_oos_check(code: str, name: str) -> str:
                       "traceback": tb_module.format_exc()})
 
 
+def _ic_series_payload(ics, counts=None) -> list[dict]:
+    """逐日 IC 序列 → 可直接 JSON 的 ``[{date, ic, n}]``。
+
+    ``ics`` 是 ``groupby(level="datetime")`` 的产物，本来就被算出来用于取均值 ——
+    这里只是不再把它丢掉。序列是**零额外计算成本**的：截面相关在标量均值算出之前
+    就已经逐个交易日算过了。
+
+    ``date`` 统一成 ``YYYY-MM-DD``：调用方要把它画到时间轴上、还要与行情日期对齐，
+    ISO 字符串比时间戳少一层歧义。``n`` 是该交易日的有效样本数（因子值与次日收益
+    同时存在的标的数）——样本太少时那条 IC 本身不可信，带上它比让前端只看一条
+    孤零零的线有用。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for dt in ics.index:
+        val = ics.loc[dt]
+        if isinstance(val, pd.Series):  # 重复日期会让 .loc 返回 Series
+            val = val.iloc[0]
+        if not np.isfinite(val):
+            continue
+        try:
+            date_str = pd.Timestamp(dt).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        # 日期唯一化：时间轴上有两个同日期点会让渲染器画出回折，且任何按日期
+        # 合并的调用方都会拿到重复键。真实 groupby 不会重复，这里是防御性的。
+        if date_str in seen:
+            continue
+        seen.add(date_str)
+        point = {"date": date_str, "ic": float(val)}
+        if counts is not None:
+            cnt = counts.get(dt)
+            point["n"] = None if cnt is None else int(cnt)
+        out.append(point)
+    return out
+
+
 def factor_recent_ic(code: str, name: str,
                      lookback_days: int = RECENT_IC_LOOKBACK) -> str:
     """周日衰减巡检（§12.3）：近 lookback_days 个交易日的日均截面 Pearson IC
     （因子值 vs 次日收益），纯 pandas 不走 qlib——周频跑全库成本必须低。
 
-    返回 JSON: {ok, ic, days, error}。数据不足（<10 个交易日）记 error。
+    返回 JSON: {ok, ic, days, series, error}。数据不足（<10 个交易日）记 error。
+    ``series`` 是逐日 IC（``[{date, ic, n}]``，按日期升序），供看板画衰减曲线；
+    它取自原本就算出来用于取均值的那个 groupby，不增加计算与内存。
 
     内存口径见 ``_run_factor_window``：整读一次全量（Fixed 格式无法部分读），
     因子值和收盘价都取自同一次暂存，不再整读第二遍。此前两次整读把峰值叠到
@@ -712,7 +752,7 @@ def factor_recent_ic(code: str, name: str,
     try:
         data_h5 = DATA_DIR / "daily_pv_all.h5"
         if not data_h5.exists():
-            return _json({"ok": False, "ic": None, "days": 0,
+            return _json({"ok": False, "ic": None, "days": 0, "series": [],
                           "error": f"data file missing: {data_h5}"})
         fac, close = _run_factor_window(code, data_h5)
         # 次日收益（T+1 开盘不可得的近似：close→close），与挖掘 label 口径同族
@@ -722,20 +762,23 @@ def factor_recent_ic(code: str, name: str,
         pair = pd.concat([fac, ret1], axis=1).dropna()
         del fac, ret1
         if pair.empty:
-            return _json({"ok": False, "ic": None, "days": 0,
+            return _json({"ok": False, "ic": None, "days": 0, "series": [],
                           "error": "no overlapping factor/return data"})
         dts = pair.index.get_level_values("datetime").unique().sort_values()
         tail = dts[-max(int(lookback_days), 1):]
         pair = pair.loc[pair.index.get_level_values("datetime").isin(tail)]
-        ics = pair.groupby(level="datetime").apply(
-            lambda x: x["factor"].corr(x["ret"])).dropna()
+        grouped = pair.groupby(level="datetime")
+        ics = grouped.apply(lambda x: x["factor"].corr(x["ret"])).dropna()
+        # 逐日有效样本数，与 IC 同一批分组，同样零额外成本
+        counts = grouped.size()
         if len(ics) < 10:
-            return _json({"ok": False, "ic": None, "days": len(ics),
+            return _json({"ok": False, "ic": None, "days": len(ics), "series": [],
                           "error": f"insufficient recent days: {len(ics)}"})
         return _json({"ok": True, "ic": float(ics.mean()), "days": len(ics),
+                      "series": _ic_series_payload(ics, counts),
                       "error": ""})
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
-        return _json({"ok": False, "ic": None, "days": 0,
+        return _json({"ok": False, "ic": None, "days": 0, "series": [],
                       "error": "factor_recent_ic worker exception",
                       "traceback": tb_module.format_exc()})
 

@@ -122,7 +122,9 @@ def factor_daily_compute(factors: list) -> str:
 
 @tool("factor_recent_ic", "Weekly decay probe: trailing N-trading-day mean "
       "cross-sectional Pearson IC (factor vs next-day return), pure pandas, no qlib. "
-      "Returns JSON string: {ok, ic, days, error}.",
+      "Returns JSON string: {ok, ic, days, series, error}. `series` is the per-day "
+      "IC breakdown [{date, ic, n}] (ascending by date) for decay curves — it comes "
+      "from the same groupby that already produced `ic`, so it costs nothing extra.",
       {"code": {"type": "string", "description": "factor.py source code"},
        "name": {"type": "string", "description": "factor name"},
        "lookback_days": {"type": "integer", "description": "Trailing trading days (default 60)", "default": 60}},
