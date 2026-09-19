@@ -5,7 +5,7 @@ A 股量化因子挖掘工具集的独立 MCP（Model Context Protocol）服务�
 factor 域，让任何 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研
 Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上线巡检」流水线。
 
-## 工具清单（16 个）
+## 工具清单（17 个）
 
 **因子挖掘**
 
@@ -16,6 +16,7 @@ Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上
 | `factor_oos_check` | 生产准入 OOS 检查：挖掘窗口 vs 纯样本外窗口，报告 IC/年化/回撤 + 衰减（同上，可外置） | 重（异步） |
 | `factor_daily_compute` | 每日收盘后计算在线因子，写 Redis `dfactor:{symbol}`（TTL 48h） | 重（异步） |
 | `update_data` | qlib cn_data 每日增量更新（三源熔断 + 原子切换）+ 重建 h5 数据集 | 重（异步） |
+| **`factor_evaluate`** | **一段因子代码 → 专业评估（一条链）**：沙箱跑代码 + 同窗口切片对齐的 alphalens 口径 tearsheet，附**单调性 / IC 半衰期 / IC t 值 / 假设缺失标记**。补上 `factor_execute`（只有契约检查）与 `factor_tearsheet`（要自带 factor_values+klines）之间的断链 | 重（异步） |
 | `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 轻 |
 | `compute_factors` | 从 OHLCV K线计算 Alpha158 风格因子（纯 pandas） | 轻 |
 | `predict` | 因子值 → ML 信号预测 | 轻 |
@@ -70,6 +71,34 @@ mean/std。网络结构 vendor 自官方仓库（`factor_miner/master_nn.py`，M
 
 重负载工具提交即入队返回 `job_id`，轮询 `GET /jobs/<id>` 拿结果，
 不占 HTTP 连接。
+
+### `factor_evaluate`：从「一段代码」到「专业指标」的一条链
+
+`factor_execute` 只回契约检查（`eval_ok` / `eval_detail`），**不回因子值**；
+`factor_tearsheet` 要调用方自带 `factor_values` + `klines`。两者之间本来是断的
+——任何 agent 都拿不到「代码 → 分层收益 / IC / 换手」。`factor_evaluate` 接上它：
+
+```
+factor_evaluate(code, hypothesis?) 
+  = 沙箱跑 code（_run_factor_window：白名单 + rlimit + 120s）
+  + 同一次窗口切片给的 close（因子值与价格天然对齐，不做事后 intersect）
+  + analytics.factor_tearsheet（alphalens 口径，原样透传）
+  + 专业摘要：严格单调性(+rho) / IC 半衰期（决定持有期） / IC t 值 / 假设缺失标记
+```
+
+实测（真实 `daily_pv_all.h5`，333MB，4809 标的，window_days=120）：
+
+| 阶段 | 耗时 |
+|---|---|
+| `stage_h5_for_sandbox`（Fixed 格式只能整读，截窗 + 写盘） | 117.7s |
+| 沙箱跑因子代码 | 27.2s |
+| 读回 result.h5 + 窗口 close | 2.9s |
+| 拼面板 | 12.3s |
+| tearsheet | 18.6s |
+
+**所以它必须走异步队列**（`server.py` 的 `ASYNC_TOOLS`）——一次评估是分钟级，
+不是秒级。整读全量的开销与 `factor_execute` / `factor_recent_ic` 同源，
+不是本工具引入的。
 
 ### 实现说明与算法出处
 
@@ -169,7 +198,7 @@ volumes:
 
 ## 数据准备（回测类工具需要）
 
-`factor_execute` / `factor_backtest` / `factor_oos_check` 依赖 qlib
+`factor_execute` / `factor_evaluate` / `factor_backtest` / `factor_oos_check` 依赖 qlib
 cn_data 导出的日频量价 h5 数据集：
 
 ```bash
@@ -335,7 +364,7 @@ scrape_configs:
 
 ## 沙箱安全模型
 
-`factor_execute` 等执行用户提交的 factor.py 时在子进程沙箱中运行：
+`factor_execute` / `factor_evaluate` 等执行用户提交的 factor.py 时在子进程沙箱中运行：
 AST import 白名单（仅 pandas/numpy 等）、rlimit 资源限制、120s 超时、
 隔离工作目录。实现见 `factor_miner/sandbox.py`。
 
