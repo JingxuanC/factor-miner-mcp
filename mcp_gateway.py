@@ -160,19 +160,43 @@ class LicenseStore:
             logger.warn("usage file load failed, reset: %s", e)
 
     def _save_usage(self):
+        """原子落盘用量。
+
+        临时文件名**必须每次唯一**。用 `.with_suffix(".tmp")` 由目标路径推导出
+        固定名，会让并发写共用同一个 `.tmp`：A 先 rename 走，B 的 rename 源文件
+        已不存在，报 ENOENT —— 而这里的 except 只记 warning，于是额度被静默少记
+        一次（生产实测 2026-09-17 出现过一次这条日志）。
+
+        `consume()` 在 HTTP 请求线程里被调，网关是 ThreadingHTTPServer，所以并发
+        是常态而不是边缘情况。唯一名 + 同目录 rename 保证：每次落盘互不干扰，且
+        os.replace 仍在同一文件系统内原子生效。
+        """
         if not self._usage_file:
             return
+        # 裁剪 + 写盘 + rename 全部在锁内：rename 是"最后写者赢"，写盘若与扣减
+        # 交错，先完成的那次扣减会被后写的那份快照覆盖掉（实测：两次扣额度只落
+        # 盘 1 次）。临界区只有几百字节写 + 一次 rename，不构成阻塞风险。
         try:
-            # 只保留近 3 天，防文件膨胀
             with self._mu:
+                # 只保留近 3 天，防文件膨胀
                 days = sorted(self._usage)[-3:]
                 slim = {d: self._usage[d] for d in days}
                 self._usage = slim
-            tmp = self._usage_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(slim, ensure_ascii=False))
-            os.replace(tmp, self._usage_file)
+                tmp = self._usage_file.with_name(
+                    f"{self._usage_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                try:
+                    tmp.write_text(json.dumps(slim, ensure_ascii=False))
+                    os.replace(tmp, self._usage_file)
+                finally:
+                    # 落盘成功时 tmp 已被 rename 走；失败时它是垃圾。清理失败也不能
+                    # 把原始错误盖掉。
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         except Exception as e:  # noqa: BLE001
-            logger.warn("usage save failed: %s", e)
+            logger.warning("usage save failed: %s", e)
 
 
 # ═══════════════ Prometheus 指标 ═══════════════

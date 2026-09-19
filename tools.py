@@ -100,7 +100,10 @@ def factor_backtest(sota: list, new_factors: list, profile: str = "full", window
 @tool("factor_oos_check", "Production-admission OOS check: run the factor twice — "
       "mining window (test 2017→now) and pure out-of-sample window (test 2021-01→now) — "
       "report IC/annualized/max_drawdown for both plus relative decay. "
-      "Returns JSON string: {oos: {ic, annualized_return, max_drawdown}, mining: {...}, decay: float|null, ok, error}.",
+      "Returns JSON string: {oos: {ic, annualized_return, max_drawdown}, mining: {...}, "
+      "decay: float|null, mining_net_curve: [{date, i, value}], oos_net_curve: [...], ok, error}. "
+      "The two net-value curves come from the report qlib already produced for each window "
+      "(downsampled to <=400 points); drawing them together is the visual read of `decay`.",
       {"code": {"type": "string", "description": "factor.py source code"},
        "name": {"type": "string", "description": "factor name"}},
       required=["code", "name"])
@@ -122,7 +125,9 @@ def factor_daily_compute(factors: list) -> str:
 
 @tool("factor_recent_ic", "Weekly decay probe: trailing N-trading-day mean "
       "cross-sectional Pearson IC (factor vs next-day return), pure pandas, no qlib. "
-      "Returns JSON string: {ok, ic, days, error}.",
+      "Returns JSON string: {ok, ic, days, series, error}. `series` is the per-day "
+      "IC breakdown [{date, ic, n}] (ascending by date) for decay curves — it comes "
+      "from the same groupby that already produced `ic`, so it costs nothing extra.",
       {"code": {"type": "string", "description": "factor.py source code"},
        "name": {"type": "string", "description": "factor name"},
        "lookback_days": {"type": "integer", "description": "Trailing trading days (default 60)", "default": 60}},
@@ -130,6 +135,34 @@ def factor_daily_compute(factors: list) -> str:
 def factor_recent_ic(code: str, name: str, lookback_days: int = 60) -> str:
     from factor_worker import factor_recent_ic as _impl
     return _impl(code, name, lookback_days)
+
+
+@tool("factor_evaluate", "One-call professional factor evaluation: run factor.py in the sandbox "
+      "and return the alphalens-style tearsheet for it — no need to supply factor_values/klines "
+      "yourself (this is the difference from factor_tearsheet, and why it closes the code→metrics "
+      "gap that factor_execute leaves open with its contract check only). Factor values and close "
+      "prices come from the same window slice, so they are exactly aligned. Adds a professional "
+      "summary: per-period quantile monotonicity (strict, plus Spearman rho), IC decay half-life in "
+      "trading days (decides holding period), IC t-stat, and a hypothesis passthrough that flags a "
+      "missing economic hypothesis. "
+      "Returns JSON string: {ok, error, tearsheet, monotonicity, ic_half_life_days, ic_t_stat, "
+      "hypothesis, hypothesis_missing, dataset, window_days, n_dates, n_symbols, eval_window}.",
+      {"code": {"type": "string", "description": "factor.py source code (sandbox: import whitelist, rlimit, 120s timeout)"},
+       "hypothesis": {"type": "string", "description": "Economic hypothesis (the professional gate); "
+                                                       "absent → hypothesis_missing=true, metrics still returned"},
+       "quantiles": {"type": "integer", "description": "Number of quantile buckets (default 5)", "default": 5},
+       "periods": {"type": "array", "description": "Forward return periods in trading days (default [1,5,10], max 120)",
+                   "default": [1, 5, 10]},
+       "dataset": {"type": "string", "enum": ["full", "debug"],
+                   "description": "full = daily_pv_all.h5 windowed to FACTOR_MINER_WINDOW_DAYS; debug = small static set",
+                   "default": "full"},
+       "window_days": {"type": "integer", "description": "Override the trailing trading-day window (0 = full history)"}},
+      required=["code"])
+def factor_evaluate(code: str, hypothesis: str = "", quantiles: int = 5,
+                    periods: Optional[list] = None, dataset: str = "full",
+                    window_days: int = None) -> str:
+    from factor_worker import factor_evaluate as _impl
+    return _impl(code, hypothesis, quantiles, periods, dataset, window_days)
 
 
 # ═══════════════════════════════════════════════════════════════

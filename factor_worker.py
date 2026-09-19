@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -27,6 +28,7 @@ import traceback as tb_module
 import uuid
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from factor_miner import factor_backtest as fb
@@ -316,11 +318,19 @@ def _correlations(new_src: "fb.FactorSrc", sota_srcs: list, version: str,
     return out
 
 
-def _render_windows_conf(work_dir: Path, profile: str, windows: dict) -> Path:
+def _render_windows_conf(work_dir: Path, profile: str, windows: dict,
+                         provider_uri: str | None = None) -> Path:
     """把 Go cfg 的回测窗口注入 conf 模板。
 
     预渲染后的 yaml 作为 conf_template 传给 run_backtest——其内部 _render_conf
     对无 Jinja 占位的文本是 no-op，profile 覆盖已在此时合并。
+
+    **provider_uri 必须在这里就注入**：因为上面那句 no-op 是双向的 —— 一旦这里渲染
+    过一次、占位被替换掉，后面再传 provider_uri 也回天无力。漏掉它的后果实测过：
+    OOS 路径（唯一走 windows 的路径）把 provider_uri 落回模板默认的
+    `~/.qlib/qlib_data/cn_data`，在执行器容器里那个路径是空的，qrun 报
+    `instrument: {...} does not contain data for day` —— 而同一因子走非 windows
+    路径时 provider_uri 是对的。
     """
     from jinja2 import Template  # noqa: PLC0415 — 与 qlib 一样保持惰性导入
 
@@ -331,6 +341,8 @@ def _render_windows_conf(work_dir: Path, profile: str, windows: dict) -> Path:
     }
     ctx.update(fb.PROFILE_OVERRIDES.get(profile, {}))
     ctx.update({k: v for k, v in windows.items() if v})
+    if provider_uri:
+        ctx["provider_uri"] = provider_uri
     out = work_dir / "conf_windows.yaml"
     out.write_text(Template(fb.DEFAULT_CONF_TEMPLATE.read_text()).render(**ctx))
     return out
@@ -354,15 +366,19 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
     sota_broken: set = set()
     metrics: dict = {}
     net_values: list = []
+    net_curve: list = []
     dropped: list = []
     errors: dict = {}
     last_tb = ""
     any_ok = False
 
+    # 远程模式下 conf 的 qlib_init.provider_uri 必须指向**执行器**的挂载路径
+    remote_uri = (os.environ.get("FACTOR_EXECUTOR_PROVIDER_URI") or None
+                  if os.environ.get("FACTOR_EXECUTOR_URL", "").strip() else None)
     for nf in new_factors:
         new_src = fb.FactorSrc(name=nf["name"], code=nf["code"])
         work_dir = BACKTEST_ROOT / uuid.uuid4().hex
-        conf = (_render_windows_conf(work_dir, profile, windows)
+        conf = (_render_windows_conf(work_dir, profile, windows, remote_uri)
                 if windows else fb.DEFAULT_CONF_TEMPLATE)
         res = fb.run_backtest(
             sota_factors=sota_srcs,
@@ -373,6 +389,10 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
             exec_cache=exec_cache,
             profile=profile,
             version=version,  # 复用本函数已算的数据版本，避免重复计算
+            execute=_executor_dispatch(work_dir, version),
+            # 远程模式下 conf 的 qlib_init.provider_uri 必须指向**执行器**的挂载路径。
+            # 本地模式不传，沿用模板默认值（行为不变）。
+            provider_uri=remote_uri,
         )
         _write_back_cache(sota_srcs + [new_src], version, work_dir)
         correlations[new_src.name] = _correlations(new_src, sota_srcs, version, work_dir)
@@ -382,6 +402,8 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
             if not metrics:
                 # 组合指标取首个成功新因子的回测（SOTA+该因子拼接口径）
                 metrics, net_values = res.metrics, res.net_values
+                # 带日期的净值曲线与 net_values 同源同口径，取同一个成功因子那一轮
+                net_curve = list(getattr(res, "net_curve", None) or [])
         elif res.dedup_dropped:
             dropped.append(new_src.name)
         else:
@@ -400,9 +422,43 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
         "metrics": metrics,
         "correlations": correlations,
         "net_values": net_values,
+        # 带日期的净值曲线（已抽稀）。net_values 保持原样不动，见 _downsample_curve。
+        "net_curve": _downsample_curve(net_curve),
         "error": error,
         "traceback": last_tb,
     }
+
+
+def _executor_dispatch(work_dir: Path, version: str | None):
+    """把 qrun 交给远程执行器跑；未配置执行器时返回 None（走本地执行）。
+
+    为什么要拆出去：qrun 是全市场 LGBM 训练，内存是 GB 级，而本容器被限制在
+    1536 MiB。实测后果是内核 memcg 直接 OOM 掉**整个 miner 容器**，并且失败的
+    qrun 会变孤儿进程继续占内存、把容器卡死到只能重启。
+
+    只搬「执行」这一步：Step 1–3（沙箱跑因子、去重闸门、拼 combined_factors）
+    留在本地，它们本来就是轻的，而且依赖面板归一化与 exec_cache。
+
+    conf 由本地渲染后传给执行器，其中 `qlib_init.provider_uri` 来自
+    `FACTOR_EXECUTOR_PROVIDER_URI`（执行器容器内的挂载路径）—— 两边必须指向
+    同一份数据。执行器侧的**面板版本校验**是兜底：不一致就拒绝执行，而不是
+    读另一份数据静默跑出偏掉的结果。
+    """
+    url = os.environ.get("FACTOR_EXECUTOR_URL", "").strip()
+    if not url:
+        return None
+
+    def execute(work: Path, conf_path: Path, timeout: int, ver: str | None) -> dict:
+        from factor_executor import client as executor_client
+
+        try:
+            return executor_client.run_backtest(work, data_version=ver,
+                                                deadline=time.time() + timeout + 120)
+        except executor_client.ExecutorError as exc:
+            # 执行器侧的问题不该伪装成"因子有问题"：以回测失败返回，但把原因写清
+            return {"ok": False, "error": f"executor error: {exc}"}
+
+    return execute
 
 
 def factor_backtest(sota: list, new_factors: list, profile: str = "full",
@@ -429,37 +485,37 @@ def factor_backtest(sota: list, new_factors: list, profile: str = "full",
 
 
 def stage_h5_for_sandbox(data_h5: Path, job_dir: Path, window_days: int) -> Path:
-    """把 h5 按窗口截取后放进 job 目录，返回沙箱要读的路径。
+    """把 h5 按窗口截取后放进 job 目录 —— 委托给 fb.stage_h5_for_sandbox。
 
-    window_days <= 0 → 旧的 symlink 全量行为（联调/需要全历史时用）。
-    窗口是"最近 N 个交易日"，索引层级名沿用原文件的 ``datetime`` / ``instrument``，
-    HDF key 保持 ``data``（因子代码惯用 ``pd.read_hdf('daily_pv.h5')`` 单 key 读取）。
+    这里刻意**不再保留第二份实现**：历史上有两份（本文件一份、_exec_factor_worker
+    自己 inline 的 symlink 一份），而后者漏了窗口，导致回测路径永远喂全量、撞破
+    沙箱地址空间上限被 SIGKILL。单一实现是这次修复的核心。
     """
-    dst = job_dir / "daily_pv.h5"
-    if window_days <= 0:
-        dst.symlink_to(data_h5.resolve())
-        return dst
-
-    df = pd.read_hdf(data_h5, key="data")
-    try:
-        dts = df.index.get_level_values("datetime").unique().sort_values()
-    except (KeyError, AttributeError):
-        # 索引层级名不是预期结构：原样落盘，不做窗口（安全兜底）
-        df.to_hdf(dst, key="data", mode="w")
-        return dst
-    if len(dts) > window_days:
-        keep = set(dts[-window_days:])
-        df = df[df.index.get_level_values("datetime").isin(keep)]
-    df.to_hdf(dst, key="data", mode="w")
-    return dst
+    return fb.stage_h5_for_sandbox(data_h5, job_dir, window_days)
 
 
-def _run_factor_df(code: str, data_h5: Path,
-                   window_days: int | None = None) -> pd.DataFrame:
-    """沙箱执行单个 factor.py 并读回 (datetime, instrument) 归一化 DataFrame。
+def _run_factor_window(code: str, data_h5: Path,
+                       window_days: int | None = None) -> tuple[pd.Series, pd.Series]:
+    """在**同一个**窗口切片上跑 factor.py，并把该切片的收盘价一并交回。
 
-    ``window_days`` 缺省用 ``WINDOW_DAYS``（默认 400 交易日）；见该常量的说明 ——
-    全量 h5 会撑爆沙箱 RLIMIT_AS。
+    返回 ``(factor_series, close_series)``，两者同为 (datetime, instrument) 索引。
+
+    存在的理由是一次全量读取代两次。``daily_pv_all.h5`` 是 pandas 的 Fixed
+    格式（PyTables 里是 ``block0_values`` 数组、没有 table），所以**无法按列或
+    按行部分读**——实测 ``columns=['$close']`` 直接 TypeError，只能整表读入，
+    一次 ~710MiB / ~27s。
+
+    ``factor_recent_ic`` 需要两样东西：因子值（来自跑完的 result.h5）和收盘价
+    （算次日收益）。原先它先让 ``_run_factor_df`` 整读一次全量去暂存窗口，再
+    自己整读第二次去取收盘价——峰值因此叠到 ~1375MiB，在 1536MiB 的容器上限
+    下把整个服务 OOM 掉（内核 memcg 击杀，容器重启）。
+
+    切片的收盘价与"整读全量再取 ``$close``"**逐值相同**：切片就是该窗口的行
+    子集，这里再按索引排序，与全量读的顺序一致。所以既省掉一次 710MiB 的整
+    读，又不改变数值口径。
+
+    job_dir 不返回：它留在 JOBS_ROOT 由 ``cleanup_stale_dirs`` 按 TTL 回收，
+    与改动前一致。
     """
     job_dir = JOBS_ROOT / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -473,7 +529,24 @@ def _run_factor_df(code: str, data_h5: Path,
         if res.timed_out:
             detail = f"[sandbox timeout {EXEC_TIMEOUT}s]\n" + detail
         raise RuntimeError(detail)
-    return fb._read_result_h5(job_dir)
+
+    factor = fb._read_result_h5(job_dir).iloc[:, 0].rename("factor")
+    staged = pd.read_hdf(job_dir / "daily_pv.h5", key="data").sort_index()
+    close = staged["$close"].rename("close")
+    del staged
+    return factor, close
+
+
+def _run_factor_df(code: str, data_h5: Path,
+                   window_days: int | None = None) -> pd.DataFrame:
+    """沙箱执行单个 factor.py 并读回 (datetime, instrument) 归一化 DataFrame。
+
+    ``window_days`` 缺省用 ``WINDOW_DAYS``（默认 400 交易日）；见该常量的说明 ——
+    全量 h5 会撑爆沙箱 RLIMIT_AS。
+    """
+    factor, close = _run_factor_window(code, data_h5, window_days)
+    del close  # 调用方只要因子值；少留一份切片在内存里
+    return factor.to_frame("factor")
 
 
 def latest_row_per_instrument(df: pd.DataFrame) -> dict:
@@ -583,6 +656,41 @@ def _pick_metrics(metrics: dict) -> dict:
     }
 
 
+# 净值曲线上行点数上限。挖掘窗口（test 2017→今）约 2200 个交易日；原样塞进 MCP
+# 响应既胖又没必要 —— 画一条曲线不需要每个交易日一个点。
+NET_CURVE_MAX_POINTS = 400
+
+
+def _downsample_curve(curve: list | None, max_points: int = NET_CURVE_MAX_POINTS) -> list:
+    """按**等距下标**抽稀净值曲线，首尾必取。
+
+    为什么是下标抽稀而不是按日期聚合：净值曲线要保留形态（回撤的深度与位置），
+    按时间聚合会改变局部极值。等距抽稀在这点上是中性的——它只丢分辨率。
+
+    刻意不做"保留极值点"的聪明抽稀：那会让抽稀后的曲线与 metrics 里的
+    max_drawdown 对不上（图上一个更深的谷），而这两个数字本应互相印证。
+    """
+    if not curve:
+        return []
+    try:
+        n = int(max_points)
+    except (TypeError, ValueError):
+        n = NET_CURVE_MAX_POINTS
+    if n <= 0 or len(curve) <= n:
+        return list(curve)
+    if n == 1:
+        return [curve[-1]]
+
+    # 等距取 n 个下标，首尾必取。用 (len-1) 而不是 len 做分母，末点才恰好命中。
+    span = len(curve) - 1
+    idxs: list[int] = []
+    for k in range(n):
+        i = round(k * span / (n - 1))
+        if not idxs or i != idxs[-1]:
+            idxs.append(i)
+    return [curve[i] for i in idxs]
+
+
 def _oos_backtest(code: str, name: str, test_start: str) -> dict:
     """单因子 qlib 回测（无 SOTA 拼接），test_start 可覆盖——OOS 与挖掘窗口共用
     train/valid 默认值（模板 2008-2014 / 2015-2016），仅 test 窗口不同（§6）。"""
@@ -605,12 +713,16 @@ def factor_oos_check(code: str, name: str) -> str:
             # 透传 traceback：因子失败的真实原因（如沙箱内存不足）之前被吞掉，
             # 只剩一句 "new factor 'x' failed"，完全无法自查（2026-09-15 实测）。
             return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
+                          "mining_net_curve": [], "oos_net_curve": [],
                           "error": f"mining-window backtest failed: {mining.get('error', '')}",
                           "traceback": mining.get("traceback", "")})
         oos = _oos_backtest(code, name, OOS_TEST_START)
         if not oos.get("ok"):
             return _json({"oos": {}, "mining": _pick_metrics(mining["metrics"]),
                           "decay": None, "ok": False,
+                          # 挖掘窗口成功了，曲线照样给出去 —— 有半张图总好过没有
+                          "mining_net_curve": _downsample_curve(mining.get("net_curve")),
+                          "oos_net_curve": [],
                           "error": f"oos-window backtest failed: {oos.get('error', '')}",
                           "traceback": oos.get("traceback", "")})
         m_ic = (mining["metrics"] or {}).get("IC")
@@ -622,13 +734,56 @@ def factor_oos_check(code: str, name: str) -> str:
             "oos": _pick_metrics(oos["metrics"]),
             "mining": _pick_metrics(mining["metrics"]),
             "decay": decay,
+            # 两条净值曲线（已抽稀）。qlib 本来就跑出了 report，此前只取了三元组
+            # metrics，曲线被丢掉。两个窗口画在同一张图上就是 decay 的可视化 ——
+            # 这也是把净值放在这里而不是别处的原因：它天然带着"两个窗口"的对比。
+            "mining_net_curve": _downsample_curve(mining.get("net_curve")),
+            "oos_net_curve": _downsample_curve(oos.get("net_curve")),
             "ok": True,
             "error": "",
         })
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
         return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
+                      "mining_net_curve": [], "oos_net_curve": [],
                       "error": "factor_oos_check worker exception",
                       "traceback": tb_module.format_exc()})
+
+
+def _ic_series_payload(ics, counts=None) -> list[dict]:
+    """逐日 IC 序列 → 可直接 JSON 的 ``[{date, ic, n}]``。
+
+    ``ics`` 是 ``groupby(level="datetime")`` 的产物，本来就被算出来用于取均值 ——
+    这里只是不再把它丢掉。序列是**零额外计算成本**的：截面相关在标量均值算出之前
+    就已经逐个交易日算过了。
+
+    ``date`` 统一成 ``YYYY-MM-DD``：调用方要把它画到时间轴上、还要与行情日期对齐，
+    ISO 字符串比时间戳少一层歧义。``n`` 是该交易日的有效样本数（因子值与次日收益
+    同时存在的标的数）——样本太少时那条 IC 本身不可信，带上它比让前端只看一条
+    孤零零的线有用。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for dt in ics.index:
+        val = ics.loc[dt]
+        if isinstance(val, pd.Series):  # 重复日期会让 .loc 返回 Series
+            val = val.iloc[0]
+        if not np.isfinite(val):
+            continue
+        try:
+            date_str = pd.Timestamp(dt).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        # 日期唯一化：时间轴上有两个同日期点会让渲染器画出回折，且任何按日期
+        # 合并的调用方都会拿到重复键。真实 groupby 不会重复，这里是防御性的。
+        if date_str in seen:
+            continue
+        seen.add(date_str)
+        point = {"date": date_str, "ic": float(val)}
+        if counts is not None:
+            cnt = counts.get(dt)
+            point["n"] = None if cnt is None else int(cnt)
+        out.append(point)
+    return out
 
 
 def factor_recent_ic(code: str, name: str,
@@ -636,34 +791,262 @@ def factor_recent_ic(code: str, name: str,
     """周日衰减巡检（§12.3）：近 lookback_days 个交易日的日均截面 Pearson IC
     （因子值 vs 次日收益），纯 pandas 不走 qlib——周频跑全库成本必须低。
 
-    返回 JSON: {ok, ic, days, error}。数据不足（<10 个交易日）记 error。
+    返回 JSON: {ok, ic, days, series, error}。数据不足（<10 个交易日）记 error。
+    ``series`` 是逐日 IC（``[{date, ic, n}]``，按日期升序），供看板画衰减曲线；
+    它取自原本就算出来用于取均值的那个 groupby，不增加计算与内存。
+
+    内存口径见 ``_run_factor_window``：整读一次全量（Fixed 格式无法部分读），
+    因子值和收盘价都取自同一次暂存，不再整读第二遍。此前两次整读把峰值叠到
+    ~1375MiB，在 1536MiB 的容器上限下会触发内核 memcg OOM，把整个服务打死。
     """
     try:
         data_h5 = DATA_DIR / "daily_pv_all.h5"
         if not data_h5.exists():
-            return _json({"ok": False, "ic": None, "days": 0,
+            return _json({"ok": False, "ic": None, "days": 0, "series": [],
                           "error": f"data file missing: {data_h5}"})
-        fac = _run_factor_df(code, data_h5).iloc[:, 0].rename("factor")
-        pv = pd.read_hdf(data_h5, key="data")
-        close = pv["$close"].rename("close")
+        fac, close = _run_factor_window(code, data_h5)
         # 次日收益（T+1 开盘不可得的近似：close→close），与挖掘 label 口径同族
         ret1 = close.groupby(level="instrument").pct_change().groupby(
             level="instrument").shift(-1).rename("ret")
+        del close
         pair = pd.concat([fac, ret1], axis=1).dropna()
+        del fac, ret1
         if pair.empty:
-            return _json({"ok": False, "ic": None, "days": 0,
+            return _json({"ok": False, "ic": None, "days": 0, "series": [],
                           "error": "no overlapping factor/return data"})
         dts = pair.index.get_level_values("datetime").unique().sort_values()
         tail = dts[-max(int(lookback_days), 1):]
         pair = pair.loc[pair.index.get_level_values("datetime").isin(tail)]
-        ics = pair.groupby(level="datetime").apply(
-            lambda x: x["factor"].corr(x["ret"])).dropna()
+        grouped = pair.groupby(level="datetime")
+        ics = grouped.apply(lambda x: x["factor"].corr(x["ret"])).dropna()
+        # 逐日有效样本数，与 IC 同一批分组，同样零额外成本
+        counts = grouped.size()
         if len(ics) < 10:
-            return _json({"ok": False, "ic": None, "days": len(ics),
+            return _json({"ok": False, "ic": None, "days": len(ics), "series": [],
                           "error": f"insufficient recent days: {len(ics)}"})
         return _json({"ok": True, "ic": float(ics.mean()), "days": len(ics),
+                      "series": _ic_series_payload(ics, counts),
                       "error": ""})
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
-        return _json({"ok": False, "ic": None, "days": 0,
+        return _json({"ok": False, "ic": None, "days": 0, "series": [],
                       "error": "factor_recent_ic worker exception",
                       "traceback": tb_module.format_exc()})
+
+
+# ═══════════════ 因子专业评估：代码 → 专业指标（一条链） ═══════════════
+#
+# 为什么需要它：`factor_execute` 只回契约检查 {eval_ok, eval_detail}，
+# `factor_tearsheet` 需要调用方自带 factor_values + klines。两者之间**没有
+# 任何工具能把一段因子代码变成专业指标** —— 因子看板因此卡住。
+# factor_evaluate 就是把仓库里已有的两块接起来：沙箱跑代码（
+# `_run_factor_window`，因子值与收盘价取自**同一次窗口切片**）+ 同仓库的
+# `analytics.factor_tearsheet`（alphalens 口径）。不是新造能力。
+
+EVAL_PERIOD_MAX = 120  # 持有期上限（交易日）；超过它 IC/分层都不再有统计意义
+
+
+def _period_to_days(key) -> int | None:
+    """"5d" → 5；无法解析返回 None（不抛，外部字典可能带任意键）。"""
+    try:
+        return int(str(key).rstrip("ds").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def quantile_monotonicity(q_mean: dict, quantiles: int) -> dict:
+    """分层收益单调性（q1..qQ 的均值序列）。
+
+    专业口径里"单调"是**严格**判断，rho 只表示趋势强度，两者分开报 ——
+    把 rho=0.9 的"几乎单调"说成单调，正是因子评估最常见的自欺。
+
+    返回 ``{rho, direction, monotonic, values}``；任一档位缺失（None）时
+    三项均为 None/unknown，不猜。
+    """
+    empty = {"rho": None, "direction": "unknown", "monotonic": None, "values": None}
+    if not isinstance(q_mean, dict) or quantiles < 2:
+        return empty
+    vals = [q_mean.get(f"q{q}") for q in range(1, int(quantiles) + 1)]
+    if any(v is None for v in vals):
+        return empty
+    vals = [float(v) for v in vals]
+    rho = None
+    try:
+        from scipy import stats as _stats  # noqa: PLC0415 — 与 analytics 同款惰性导入
+
+        rho = float(_stats.spearmanr(range(1, len(vals) + 1), vals).statistic)
+        if not math.isfinite(rho):
+            rho = None
+    except Exception:  # noqa: BLE001 — rho 只是强度指标，算不出不影响主结论
+        rho = None
+    inc = all(a < b for a, b in zip(vals, vals[1:]))
+    dec = all(a > b for a, b in zip(vals, vals[1:]))
+    direction = "increasing" if inc else ("decreasing" if dec else "non_monotonic")
+    return {"rho": rho, "direction": direction,
+            "monotonic": bool(inc or dec), "values": vals}
+
+
+def ic_half_life(decay: dict) -> float | None:
+    """IC 衰减半衰期（交易日）：|IC| 从最短持有期跌到其一半所需期数，线性插值。
+
+    输入是 tearsheet 的 ``ic.decay``，如 ``{"1d": 0.064, "5d": 0.041, "10d": 0.022}``。
+    半衰期决定**持有期**，比 IC 均值更能说明因子能不能用（§7 四张图的第 2 张）。
+    未跌到一半（长周期 IC 反而更高）返回 None —— 那是噪声不是衰减，不插值。
+    """
+    items = []
+    for k, v in (decay or {}).items():
+        p = _period_to_days(k)
+        if p is None or v is None or p <= 0:
+            continue
+        items.append((p, abs(float(v))))
+    if len(items) < 2:
+        return None
+    items.sort()
+    p0, v0 = items[0]
+    if v0 <= 0:
+        return None
+    half = v0 / 2.0
+    for i in range(1, len(items)):
+        p_prev, v_prev = items[i - 1]
+        p, v = items[i]
+        if v <= half:
+            span = v_prev - v
+            if span <= 0:
+                return float(p)
+            return float(p_prev + (p - p_prev) * (v_prev - half) / span)
+    return None
+
+
+def ic_t_stat(ic_mean, ic_std, days) -> float | None:
+    """IC 的 t 统计量 = mean/std × sqrt(N)（N = 截面 IC 的交易日数）。
+
+    没有它就只能看 IC 均值大小 —— 机构评审先看显著性再看大小（§7 的「t 2.41 ✅」）。
+    """
+    if ic_mean is None or ic_std is None or days is None:
+        return None
+    ic_std, days = float(ic_std), int(days)
+    if ic_std <= 0 or days < 2:
+        return None
+    return float(ic_mean) / ic_std * math.sqrt(days)
+
+
+def _eval_periods(periods: list | None) -> list[int]:
+    """持有期入参归一化：正整数、去重、升序、上限 EVAL_PERIOD_MAX；空则 [1,5,10]。"""
+    out = []
+    for p in (periods or [1, 5, 10]):
+        try:
+            days = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= days <= EVAL_PERIOD_MAX and days not in out:
+            out.append(days)
+    return sorted(out) or [1, 5, 10]
+
+
+def factor_evaluate(code: str, hypothesis: str = "", quantiles: int = 5,
+                    periods: list | None = None, dataset: str = "full",
+                    window_days: int | None = None) -> str:
+    """沙箱跑一段因子代码 → **直接**返回 alphalens 口径的专业评估（一条链）。
+
+    与 ``factor_execute`` 的区别：那个只回契约检查（eval_ok/eval_detail），
+    这个回**专业指标**；与 ``factor_tearsheet`` 的区别：那个要调用方自带
+    factor_values + klines，这个自带数据。
+
+    关键实现点：因子值与收盘价取自 ``_run_factor_window`` 的**同一次窗口切片**，
+    因此两者天然对齐（不需要事后 intersect，也不会出现日期轴错位）；且只整读
+    一次 h5（Fixed 格式无法部分读，两次整读会把容器 OOM 掉，见该函数说明）。
+
+    ``hypothesis``（经济假设）只做**透传 + 缺失标记**，不硬失败：专业看板要求
+    假设必填（§4），但"必填"是入库闸门，不该让一次评估拿不到指标。
+
+    返回 JSON 字符串，**永不抛异常**：
+    ``{ok, error, tearsheet, monotonicity, ic_half_life_days, ic_t_stat,
+       hypothesis, hypothesis_missing, dataset, window_days, n_dates, n_symbols,
+       eval_window, quantiles, periods}``
+    """
+    periods = _eval_periods(periods)
+    try:
+        quantiles = max(2, int(quantiles))
+    except (TypeError, ValueError):
+        quantiles = 5
+    debug = str(dataset).lower() == "debug"
+    data_h5 = DATA_DIR / ("daily_pv_debug.h5" if debug else "daily_pv_all.h5")
+    window = 0 if debug else (WINDOW_DAYS if window_days is None else int(window_days))
+    window = max(0, int(window))
+
+    ctx = {
+        "hypothesis": hypothesis or "",
+        "hypothesis_missing": not (hypothesis or "").strip(),
+        "dataset": "debug" if debug else "full",
+        "window_days": window,
+        "quantiles": quantiles,
+        "periods": periods,
+    }
+
+    if not data_h5.exists():
+        return _json({**ctx, "ok": False, "error": f"data file missing: {data_h5}",
+                      "tearsheet": None, "monotonicity": {}, "ic_half_life_days": None,
+                      "ic_t_stat": None, "n_dates": 0, "n_symbols": 0, "eval_window": {}})
+
+    # ── 1. 沙箱执行（复用 factor_execute 的执行路径，含白名单 + rlimit + 超时）──
+    try:
+        fac, close = _run_factor_window(code, data_h5, window)
+    except Exception as e:  # noqa: BLE001 — 沙箱失败要连 stderr/traceback 一起回
+        return _json({**ctx, "ok": False, "error": f"factor execution failed: {e}",
+                      "traceback": tb_module.format_exc(), "tearsheet": None,
+                      "monotonicity": {}, "ic_half_life_days": None, "ic_t_stat": None,
+                      "n_dates": 0, "n_symbols": 0, "eval_window": {}})
+
+    try:
+        # panel 契约把 close/c/price/**value** 都当价格列；result.h5 的列名是
+        # "factor"，不在别名里，改名成 close 才能被 as_dataframe 接受。
+        fac_df = fac.rename("close").reset_index()
+        px_df = close.rename("close").reset_index()
+        del fac, close
+        fac_df = fac_df.dropna(subset=["close"])
+        px_df = px_df.dropna(subset=["close"])
+        n_dates = int(fac_df["datetime"].nunique())
+        n_symbols = int(fac_df["instrument"].nunique())
+        dts = sorted(fac_df["datetime"].unique())
+        ctx["n_dates"], ctx["n_symbols"] = n_dates, n_symbols
+        ctx["eval_window"] = ({
+            "start": pd.Timestamp(dts[0]).strftime("%Y-%m-%d"),
+            "end": pd.Timestamp(dts[-1]).strftime("%Y-%m-%d"),
+        } if dts else {})
+
+        # ── 2. 专业评估（同仓库既有实现，不重写因子分析）──
+        # 直接传 DataFrame（panel 契约接受）：全量窗口 ~2.4M 行，转 dict-records
+        # 的对象开销会 OOM，而这里根本不需要走 JSON。
+        import analytics  # noqa: PLC0415 — scipy/numpy 惰性导入，未装也能 import 本模块
+
+        raw = analytics.factor_tearsheet(fac_df, px_df, quantiles, periods)
+        del fac_df, px_df
+    except Exception:  # noqa: BLE001 — tool 通道永不抛异常
+        return _json({**ctx, "ok": False, "error": "factor_evaluate worker exception",
+                      "traceback": tb_module.format_exc(), "tearsheet": None,
+                      "monotonicity": {}, "ic_half_life_days": None, "ic_t_stat": None})
+
+    tear = json.loads(raw)
+    if "error" in tear:
+        # tearsheet 自己走 error 分支（样本不足/形状无法解析）—— 透传原因，
+        # 否则上层只能看到"评估失败的评估"，与 §7 说的静默失败同源。
+        return _json({**ctx, "ok": False, "error": tear["error"], "tearsheet": None,
+                      "monotonicity": {}, "ic_half_life_days": None, "ic_t_stat": None})
+
+    # ── 3. 专业摘要层（单调性 / 半衰期 / t 值）──
+    monotonicity = {
+        p: quantile_monotonicity(
+            ((tear.get("quantile_returns") or {}).get(p) or {}).get("mean_period_return"),
+            quantiles)
+        for p in tear.get("quantile_returns") or {}
+    }
+    ic = tear.get("ic") or {}
+    return _json({
+        **ctx,
+        "ok": True,
+        "error": "",
+        "tearsheet": tear,
+        "monotonicity": monotonicity,
+        "ic_half_life_days": ic_half_life(ic.get("decay") or {}),
+        "ic_t_stat": ic_t_stat(
+            ic.get("mean"), ic.get("std"), (ic.get("series_summary") or {}).get("days")),
+    })

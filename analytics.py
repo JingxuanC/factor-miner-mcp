@@ -88,7 +88,11 @@ def factor_tearsheet(factor_values: list, klines: dict,
     quantiles = max(2, int(quantiles))
 
     try:
-        fdf = panel.as_dataframe(factor_values or [])
+        # 显式判 None，不用 `or []`：panel 契约接受 DataFrame 入参（进程内调用方
+        # 直接传面板），而 DataFrame 的布尔判定会抛 ValueError（truth value is
+        # ambiguous）。也刻意不把 DataFrame 转 dict-records —— 全量窗口是
+        # 400 交易日 × 数千标的（~2.4M 行），转 records 的对象开销会直接 OOM。
+        fdf = panel.as_dataframe([] if factor_values is None else factor_values)
     except panel.PanelError as e:
         return json.dumps({"error": "factor_values 无法解析: %s" % e})
     if fdf.empty or not {"date", "symbol", "close"} <= set(fdf.columns):

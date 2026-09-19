@@ -5,17 +5,18 @@ A 股量化因子挖掘工具集的独立 MCP（Model Context Protocol）服务�
 factor 域，让任何 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研
 Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上线巡检」流水线。
 
-## 工具清单（16 个）
+## 工具清单（17 个）
 
 **因子挖掘**
 
 | 工具 | 说明 | 负载 |
 |------|------|------|
 | `factor_execute` | 沙箱执行 factor.py（import 白名单 + rlimit + 120s 超时），跑评估电池 | 重（异步） |
-| `factor_backtest` | 全量 qlib 回测：SOTA 因子 + 新因子对齐 Alpha20 baseline，qrun 出指标 | 重（异步） |
-| `factor_oos_check` | 生产准入 OOS 检查：挖掘窗口 vs 纯样本外窗口，报告 IC/年化/回撤 + 衰减 | 重（异步） |
+| `factor_backtest` | 全量 qlib 回测：SOTA 因子 + 新因子对齐 Alpha20 baseline，qrun 出指标（可交给独立执行器跑，见下文） | 重（异步） |
+| `factor_oos_check` | 生产准入 OOS 检查：挖掘窗口 vs 纯样本外窗口，报告 IC/年化/回撤 + 衰减（同上，可外置） | 重（异步） |
 | `factor_daily_compute` | 每日收盘后计算在线因子，写 Redis `dfactor:{symbol}`（TTL 48h） | 重（异步） |
 | `update_data` | qlib cn_data 每日增量更新（三源熔断 + 原子切换）+ 重建 h5 数据集 | 重（异步） |
+| **`factor_evaluate`** | **一段因子代码 → 专业评估（一条链）**：沙箱跑代码 + 同窗口切片对齐的 alphalens 口径 tearsheet，附**单调性 / IC 半衰期 / IC t 值 / 假设缺失标记**。补上 `factor_execute`（只有契约检查）与 `factor_tearsheet`（要自带 factor_values+klines）之间的断链 | 重（异步） |
 | `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 轻 |
 | `compute_factors` | 从 OHLCV K线计算 Alpha158 风格因子（纯 pandas） | 轻 |
 | `predict` | 因子值 → ML 信号预测 | 轻 |
@@ -70,6 +71,34 @@ mean/std。网络结构 vendor 自官方仓库（`factor_miner/master_nn.py`，M
 
 重负载工具提交即入队返回 `job_id`，轮询 `GET /jobs/<id>` 拿结果，
 不占 HTTP 连接。
+
+### `factor_evaluate`：从「一段代码」到「专业指标」的一条链
+
+`factor_execute` 只回契约检查（`eval_ok` / `eval_detail`），**不回因子值**；
+`factor_tearsheet` 要调用方自带 `factor_values` + `klines`。两者之间本来是断的
+——任何 agent 都拿不到「代码 → 分层收益 / IC / 换手」。`factor_evaluate` 接上它：
+
+```
+factor_evaluate(code, hypothesis?) 
+  = 沙箱跑 code（_run_factor_window：白名单 + rlimit + 120s）
+  + 同一次窗口切片给的 close（因子值与价格天然对齐，不做事后 intersect）
+  + analytics.factor_tearsheet（alphalens 口径，原样透传）
+  + 专业摘要：严格单调性(+rho) / IC 半衰期（决定持有期） / IC t 值 / 假设缺失标记
+```
+
+实测（真实 `daily_pv_all.h5`，333MB，4809 标的，window_days=120）：
+
+| 阶段 | 耗时 |
+|---|---|
+| `stage_h5_for_sandbox`（Fixed 格式只能整读，截窗 + 写盘） | 117.7s |
+| 沙箱跑因子代码 | 27.2s |
+| 读回 result.h5 + 窗口 close | 2.9s |
+| 拼面板 | 12.3s |
+| tearsheet | 18.6s |
+
+**所以它必须走异步队列**（`server.py` 的 `ASYNC_TOOLS`）——一次评估是分钟级，
+不是秒级。整读全量的开销与 `factor_execute` / `factor_recent_ic` 同源，
+不是本工具引入的。
 
 ### 实现说明与算法出处
 
@@ -169,7 +198,7 @@ volumes:
 
 ## 数据准备（回测类工具需要）
 
-`factor_execute` / `factor_backtest` / `factor_oos_check` 依赖 qlib
+`factor_execute` / `factor_evaluate` / `factor_backtest` / `factor_oos_check` 依赖 qlib
 cn_data 导出的日频量价 h5 数据集：
 
 ```bash
@@ -181,6 +210,86 @@ python3 -m factor_miner.gen_data --full      # 全量（回测用）
 
 `factor_recent_ic` / `compute_factors` / `predict` 纯 pandas 实现，
 不依赖 qlib，开箱即用。
+
+## 把 qrun 拆出去跑（`factor_executor/`，可选）
+
+`qrun` 是全市场 LGBM 训练 + 组合回测，**内存是 GB 级**；而 miner 容器通常被限制在
+1.5 GiB 左右。两者塞在同一个 cgroup 里的后果实测过：
+
+- qrun 撞顶 → **内核 memcg 把整个 miner 容器杀掉**（不是只杀那个任务）→
+  `unless-stopped` 重启 → 客户端看到 `RemoteProtocolError`
+- 失败的 qrun 会变成**孤儿进程继续占内存**，把容器卡在 1522/1536 MiB，
+  此后**任何**请求都必然 OOM，只能重启清场
+
+`factor_executor/` 把**只有第 4 步**（执行 + 解析）搬到一个独立进程/容器：
+
+```
+miner 容器（轻）                          executor 容器（重）
+  Step 1 沙箱跑因子                          qrun（自有 cgroup 上限）
+  Step 2 去重闸门（日频 IC）        ──►      LGBM 训练 + 组合回测
+  Step 3 拼 combined_factors_df.h5          解析 mlruns → metrics
+  Step 4 交给执行器（若已配置）
+```
+
+Step 1–3 留在本地，因为它们本来就轻、且依赖面板归一化与 exec_cache。
+
+**开启方式**：miner 侧设 `FACTOR_EXECUTOR_URL`，空 = 继续本地执行（默认，行为不变）。
+
+**共享文件系统是硬前提**：请求里传的是**路径**不是文件内容（几十 MB 的面板不适合
+走 HTTP 请求体），所以 miner 与执行器必须把宿主机上的 backtest 根目录挂到**同一个
+容器路径**（默认 `/work`）。不一致时提交会被明确拒绝，而不是等 qrun 报一个看不懂的错。
+
+**qlib 数据必须挂祖父目录**：日更的 atomic_swap 会整体 rename 替换 `cn_data`，
+挂更深的子目录会在一次日更后指向已删除的 inode。所以挂 `qlib_data` 这一层：
+
+```yaml
+# compose 片段（执行器）
+factor-executor:
+  build: {context: ./factor-miner-mcp}
+  command: ["python3", "-m", "factor_executor.server"]
+  environment:
+    EXECUTOR_JOB_ROOT: /work
+    EXECUTOR_QLIB_ROOT: /qlib_data
+    EXECUTOR_PANEL_H5: /data/factor_mining/daily_pv_all.h5
+    EXECUTOR_MEM_LIMIT_MB: "7168"    # qrun 子进程的 RLIMIT_AS（见下方实测）
+    EXECUTOR_TIMEOUT: "1800"
+  volumes:
+    - ./backtests:/work                       # 与 miner 同挂同一宿主目录
+    - /opt/athena-mcp/qlib_data:/qlib_data:ro # ⚠️ 祖父目录
+    - /opt/athena-mcp/data/factor_mining:/data/factor_mining:ro
+```
+
+miner 侧对应加 `FACTOR_EXECUTOR_URL=http://factor-executor:50054`，并把
+`<backtests>:/work` 也挂上。
+
+**数据版本会校验**：请求带 miner 侧的面板版本（manifest 的 `h5_sha256` 优先），
+执行器比对不一致就**拒绝执行** —— 面板与执行器 qlib 数据不同源时回测会静默偏掉，
+那比失败糟糕得多。
+
+**失败隔离**：每个 job 一个独立会话/进程组，超时或失败都按**组**收割（`killpg`），
+不会再留孤儿；`-9` 会被翻译成"很可能是内存不足"的提示。执行器崩了不影响 miner
+的其它工具。
+
+### qrun 要多少内存（生产实测，别再按猜的值配）
+
+`factor_oos_check` 走 full profile = **`market: csi300` + `start_time 2008` + `test_end null`**，
+也就是全量 csi300 跨十余年的 Alpha158 特征 + LGBM 训练 + 组合回测。在这台机器
+（7.4G 总内存）上实测：
+
+| 配置 | 结果 |
+|---|---|
+| `RLIMIT_AS = 5120 MiB` | **失败** —— qrun 90s 后 `MemoryError: Unable to allocate 80.0 MiB`；申请 80MiB 都失败说明是**地址空间**耗尽，不是机器没内存 |
+| `RLIMIT_AS` 不限，容器 10 GiB | 成功，cgroup 峰值 **3783 MiB** |
+| `RLIMIT_AS = 7168 MiB` + 容器 `mem_limit: 8192m` | **成功**，cgroup 峰值 **3581 MiB**（留约 2× 余量） |
+
+**要注意的是虚拟地址空间，不是 RSS**：5120 MiB 的 RAS 都过不去，而实际 RSS 只有
+~3.6 GiB —— qlib/pandas 的 mmap 与中间对象让 VA 明显高于常驻。所以这个上限不能照着
+"RSS × 1.2" 去设。
+
+`mem_limit` 与 `RLIMIT_AS` 刻意都设、且 `RLIMIT_AS < mem_limit`：前者是容器护栏，
+后者让 qrun 先于容器被自己杀掉（不会拖累执行器进程本身）。
+
+相关测试：`test_factor_executor.py`（用假 qrun 驱动，不需要 pyqlib，本机可跑）。
 
 ## 每日数据同步（update_data）
 
@@ -255,7 +364,7 @@ scrape_configs:
 
 ## 沙箱安全模型
 
-`factor_execute` 等执行用户提交的 factor.py 时在子进程沙箱中运行：
+`factor_execute` / `factor_evaluate` 等执行用户提交的 factor.py 时在子进程沙箱中运行：
 AST import 白名单（仅 pandas/numpy 等）、rlimit 资源限制、120s 超时、
 隔离工作目录。实现见 `factor_miner/sandbox.py`。
 

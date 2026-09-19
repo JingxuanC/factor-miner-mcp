@@ -50,7 +50,7 @@ RUN pip install --no-index --find-links=/tmp/wheels pysocks socksio \
       pip install --no-deps /tmp/wheels/torch-*.whl \
    && pip install ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} \
         filelock "typing-extensions>=4.10" "sympy>=1.13.3" "networkx>=2.5.1" \
-        jinja2 "fsspec>=0.2.3" setuptools; \
+        "fsspec>=0.2.3" setuptools; \
     elif [ -n "$PIP_INDEX_URL" ]; then \
       pip install --index-url "$PIP_INDEX_URL" torch; \
     else \
@@ -61,11 +61,13 @@ RUN pip install --no-index --find-links=/tmp/wheels pysocks socksio \
 COPY requirements.txt ./
 # --timeout/--retries：镜像站偶发"连上但不回数据"，pip 默认无超时会永久 poll 在
 # 一个 socket 上（曾连续卡 54 分钟、构建缓存冻住）。给每次请求兜超时与重试。
+# jinja2 在 requirements.txt 里（渲染 conf 不依赖 qlib，见那里的注释）——下面
+# 的 qlib 分支只装 qlib/mlflow。
 RUN pip install --timeout 30 --retries 5 -r requirements.txt \
     && arch="$(dpkg --print-architecture)" \
     && if [ "$WITH_QLIB" != "0" ]; then \
          if [ "$arch" = "amd64" ]; then \
-           pip install --timeout 30 --retries 5 "pyqlib>=0.9.6" jinja2 mlflow; \
+           pip install --timeout 30 --retries 5 "pyqlib>=0.9.6" mlflow; \
          elif [ "$WITH_QLIB" = "1" ]; then \
            if [ -n "$APT_MIRROR" ]; then \
              sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
@@ -73,7 +75,7 @@ RUN pip install --timeout 30 --retries 5 -r requirements.txt \
            && apt-get update \
            && apt-get install -y --no-install-recommends build-essential git \
            && pip install --timeout 30 --retries 5 "cython<3" "numpy>=1.26,<2" \
-           && pip install --timeout 30 --retries 5 "git+${QLIB_GIT_URL}@v0.9.7" jinja2 mlflow \
+           && pip install --timeout 30 --retries 5 "git+${QLIB_GIT_URL}@v0.9.7" mlflow \
            && apt-get purge -y build-essential git \
            && apt-get autoremove -y \
            && rm -rf /var/lib/apt/lists/*; \
