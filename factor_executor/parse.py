@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +20,59 @@ logger = logging.getLogger("factor-executor.parse")
 
 # 买卖点导出上限（TopkDropout 每日调仓，多年全市场回测会让 JSON 膨胀）
 MAX_TRADES = 5000
+
+
+def _net_curve(report) -> list:
+    """组合净值 → ``[{date, value}]``。与 factor_backtest._net_curve 同口径。
+
+    取 qlib 报告自身的日期索引与 ``value`` 列（qlib 记录的账户净值本身），而不是
+    从 return/cost 累乘重建 —— 后者会与官方口径有细微偏差，而这个序列要跟同一份
+    recorder 读出的年化/回撤对得上。
+
+    **数值索引显式退回下标 ``i``**：``pd.Timestamp(0)`` 会静默返回 1970-01-01
+    （不抛异常），于是 RangeIndex 报告会变成"1970 年的净值曲线"，比没有日期更糟。
+    其余情况尝试解析日期，解析不了同样退回下标 —— 宁可 x 轴是"第 N 个交易日"，
+    也不要整条曲线消失或标注错误年份。
+    只丢**开头**的 0：生产实测 7 份 report **每一份**的 ``value`` 首值都是 ``0.0``
+    （qlib 首日占位），而紧随其后的才是真实账户权益（约 8.7e7）。留着它，曲线会从 0
+    起步，读起来像"亏光了本金"，而且会把整个 y 轴压扁。``i`` 在丢弃后保持原值，
+    所以时间轴不会因此错位。序列中间的 0 是真实净值，不能动；整条序列全为 0 时原样
+    返回，免得用"没有曲线"代替"曲线是平的"。
+    """
+    if report is None:
+        return []
+    try:
+        values = report["value"]
+    except Exception:  # noqa: BLE001 — 报告结构变化
+        return []
+
+    out: list = []
+    # 数值索引 → 不解析日期（pandas 会静默给出 1970 epoch）
+    numeric_index = pd.api.types.is_numeric_dtype(report.index)
+    for i, (idx, raw) in enumerate(values.items()):
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v):
+            continue
+        date = None
+        if not numeric_index:
+            try:
+                ts = pd.Timestamp(idx)
+                date = None if pd.isna(ts) else ts.strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                date = None
+        out.append({"date": date, "i": i, "value": v})
+    # 丢掉开头的 0（qlib 首日占位）。只丢开头 —— 中间的 0 是真实净值。
+    first_nonzero = None
+    for k, p in enumerate(out):
+        if p["value"] != 0:
+            first_nonzero = k
+            break
+    if first_nonzero:
+        out = out[first_nonzero:]
+    return out
 
 
 def _pick(metrics: dict, *keys: str) -> float | None:
@@ -123,4 +177,4 @@ def read_exp_res(work_dir: Path, provider_uri: str) -> tuple[dict, list[float], 
         trades = positions_to_trades(dict(positions))
     except Exception as exc:  # noqa: BLE001 — 持仓产物缺失/损坏不阻塞主结果
         logger.debug("positions unavailable, trades left empty: %s", exc)
-    return metrics, [float(v) for v in net], trades
+    return metrics, [float(v) for v in net], trades, _net_curve(report)

@@ -238,7 +238,7 @@ def _run_qrun(job_dir: Path) -> dict[str, Any]:
         }
 
     try:
-        metrics, net_values, trades = read_exp_res(job_dir, provider_uri())
+        metrics, net_values, trades, net_curve = read_exp_res(job_dir, provider_uri())
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
@@ -251,6 +251,8 @@ def _run_qrun(job_dir: Path) -> dict[str, Any]:
         "metrics": metrics,
         "net_values": net_values,
         "trades": trades,
+        # 带日期的净值曲线（qlib 官方 value 列）。追加字段，既有消费者不受影响。
+        "net_curve": net_curve,
         "elapsed_sec": elapsed,
     }
 

@@ -39,6 +39,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -123,6 +124,10 @@ class BacktestResult:
     sota_broken: list[str] = field(default_factory=list)
     metrics: dict[str, float] = field(default_factory=dict)
     net_values: list[float] = field(default_factory=list)
+    # 带日期的净值曲线 [{date, i, value}]（qlib 官方 value 列）。与 net_values 同源，
+    # 但 net_values 是"只有数值"的既有形状，下游（执行器 result.json / Go 侧）依赖它，
+    # 所以新增字段而不是改掉它。
+    net_curve: list[dict] = field(default_factory=list)
     trades: list[dict] = field(default_factory=list)  # 买卖点标记 [{symbol,date,action}]
     error: str = ""
     traceback: str = ""
@@ -134,6 +139,7 @@ class BacktestResult:
             "sota_broken": self.sota_broken,
             "metrics": self.metrics,
             "net_values": self.net_values,
+            "net_curve": self.net_curve,
             "trades": self.trades,
             "error": self.error,
             "traceback": self.traceback,
@@ -195,6 +201,62 @@ def _normalize_index(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df.index = pd.MultiIndex.from_arrays([dt, inst], names=["datetime", "instrument"])
     return df.sort_index()
+
+
+def _net_curve(report) -> list:
+    """组合净值 → ``[{date, value}]``，取 qlib 报告自身的日期索引与 ``value`` 列。
+
+    为什么用 ``value`` 而不是从 return/cost 累乘重建：``value`` 是 qlib 逐日记录的
+    账户净值本身（分母/初始资金口径由 qlib 决定），累乘重建会引入与官方口径的
+    细微偏差，而这个序列是要画给使用者看的净值曲线 —— 用官方值更对得上
+    metrics 里的年化/回撤（那两项也是从同一份 recorder 读的）。
+
+    索引确实是 datetime（生产实测：``index.name='datetime'``、
+    ``dtype=datetime64[us]``，2021-01-04 → 2026-08-26 共 1369 行），但索引形态不是
+    本函数能保证的，而**数值索引会被 pandas 静默当成 epoch**——``pd.Timestamp(0)``
+    返回 1970-01-01 且不抛异常，于是一条 RangeIndex 报告会变成"1970 年的净值曲线"，
+    比没有日期更糟。所以数值索引显式退回下标 ``i``；其余情况尝试解析，解析不了
+    同样退回下标 —— 宁可 x 轴是"第 N 个交易日"，也不要整条曲线消失或标注错误年份。
+    只丢**开头**的 0：生产实测 7 份 report **每一份**的 ``value`` 首值都是 ``0.0``
+    （qlib 首日占位），而紧随其后的才是真实账户权益（约 8.7e7）。留着它，曲线会从 0
+    起步，读起来像"亏光了本金"，而且会把整个 y 轴压扁。``i`` 在丢弃后保持原值，
+    所以时间轴不会因此错位。序列中间的 0 是真实净值，不能动；整条序列全为 0 时原样
+    返回，免得用"没有曲线"代替"曲线是平的"。
+    """
+    if report is None:
+        return []
+    try:
+        values = report["value"]
+    except Exception:  # noqa: BLE001 — 没有 value 列（报告结构变化）
+        return []
+
+    out: list = []
+    # 数值索引 → 不解析日期（pandas 会静默给出 1970 epoch）
+    numeric_index = pd.api.types.is_numeric_dtype(report.index)
+    for i, (idx, raw) in enumerate(values.items()):
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v):
+            continue
+        date = None
+        if not numeric_index:
+            try:
+                ts = pd.Timestamp(idx)
+                date = None if pd.isna(ts) else ts.strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                date = None
+        out.append({"date": date, "i": i, "value": v})
+    # 丢掉开头的 0（qlib 首日占位）。只丢开头 —— 中间的 0 是真实净值。
+    first_nonzero = None
+    for k, p in enumerate(out):
+        if p["value"] != 0:
+            first_nonzero = k
+            break
+    if first_nonzero:
+        out = out[first_nonzero:]
+    return out
 
 
 def _read_result_h5(job_dir: Path) -> pd.DataFrame:
@@ -396,13 +458,16 @@ def read_exp_res(work_dir: Path, provider_uri: str = DEFAULT_PROVIDER_URI) -> tu
 
     report = latest_recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
     net = ((report["return"] - report["cost"] + 1).cumprod()).tolist()  # with_cost 净值
+    # 带日期的净值曲线（qlib 官方 value 列）。net_values 保持原样不动 —— 它在
+    # 下游有既有消费者（执行器 result.json、Go 侧），改形状会连带打断它们。
+    net_curve = _net_curve(report)
     trades: list[dict] = []
     try:
         positions = latest_recorder.load_object("portfolio_analysis/positions_normal_1day.pkl")
         trades = _positions_to_trades(dict(positions))
     except Exception:  # noqa: BLE001 — 持仓产物缺失/损坏不阻塞主结果
         pass
-    return metrics, [float(v) for v in net], trades
+    return metrics, [float(v) for v in net], trades, net_curve
 
 
 def run_backtest(
@@ -534,8 +599,11 @@ def run_backtest(
     metrics = outcome.get("metrics") or {}
     net_values = outcome.get("net_values") or []
     trades = outcome.get("trades") or []
+    # 远程路径由执行器带回 net_curve；本地路径由 execute_local 填充。都会走这里。
+    net_curve = outcome.get("net_curve") or []
     return BacktestResult(
-        ok=True, sota_broken=sota_broken, metrics=metrics, net_values=net_values, trades=trades
+        ok=True, sota_broken=sota_broken, metrics=metrics, net_values=net_values,
+        net_curve=net_curve, trades=trades,
     )
 
 
@@ -573,14 +641,15 @@ def execute_local(work_dir: Path, timeout: int = DEFAULT_TIMEOUT) -> dict:
             "traceback": proc.stderr[-4000:] if proc.stderr else proc.stdout[-4000:],
         }
     try:
-        metrics, net_values, trades = read_exp_res(work_dir)
+        metrics, net_values, trades, net_curve = read_exp_res(work_dir)
     except Exception:  # noqa: BLE001
         return {
             "ok": False,
             "error": "failed to parse qrun output",
             "traceback": tb_module.format_exc(),
         }
-    return {"ok": True, "metrics": metrics, "net_values": net_values, "trades": trades}
+    return {"ok": True, "metrics": metrics, "net_values": net_values, "trades": trades,
+            "net_curve": net_curve}
 
 
 def _load_factor_src(name: str, path: str) -> FactorSrc:

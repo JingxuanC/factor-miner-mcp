@@ -100,7 +100,10 @@ def factor_backtest(sota: list, new_factors: list, profile: str = "full", window
 @tool("factor_oos_check", "Production-admission OOS check: run the factor twice — "
       "mining window (test 2017→now) and pure out-of-sample window (test 2021-01→now) — "
       "report IC/annualized/max_drawdown for both plus relative decay. "
-      "Returns JSON string: {oos: {ic, annualized_return, max_drawdown}, mining: {...}, decay: float|null, ok, error}.",
+      "Returns JSON string: {oos: {ic, annualized_return, max_drawdown}, mining: {...}, "
+      "decay: float|null, mining_net_curve: [{date, i, value}], oos_net_curve: [...], ok, error}. "
+      "The two net-value curves come from the report qlib already produced for each window "
+      "(downsampled to <=400 points); drawing them together is the visual read of `decay`.",
       {"code": {"type": "string", "description": "factor.py source code"},
        "name": {"type": "string", "description": "factor name"}},
       required=["code", "name"])

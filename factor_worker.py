@@ -366,6 +366,7 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
     sota_broken: set = set()
     metrics: dict = {}
     net_values: list = []
+    net_curve: list = []
     dropped: list = []
     errors: dict = {}
     last_tb = ""
@@ -401,6 +402,8 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
             if not metrics:
                 # 组合指标取首个成功新因子的回测（SOTA+该因子拼接口径）
                 metrics, net_values = res.metrics, res.net_values
+                # 带日期的净值曲线与 net_values 同源同口径，取同一个成功因子那一轮
+                net_curve = list(getattr(res, "net_curve", None) or [])
         elif res.dedup_dropped:
             dropped.append(new_src.name)
         else:
@@ -419,6 +422,8 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
         "metrics": metrics,
         "correlations": correlations,
         "net_values": net_values,
+        # 带日期的净值曲线（已抽稀）。net_values 保持原样不动，见 _downsample_curve。
+        "net_curve": _downsample_curve(net_curve),
         "error": error,
         "traceback": last_tb,
     }
@@ -651,6 +656,41 @@ def _pick_metrics(metrics: dict) -> dict:
     }
 
 
+# 净值曲线上行点数上限。挖掘窗口（test 2017→今）约 2200 个交易日；原样塞进 MCP
+# 响应既胖又没必要 —— 画一条曲线不需要每个交易日一个点。
+NET_CURVE_MAX_POINTS = 400
+
+
+def _downsample_curve(curve: list | None, max_points: int = NET_CURVE_MAX_POINTS) -> list:
+    """按**等距下标**抽稀净值曲线，首尾必取。
+
+    为什么是下标抽稀而不是按日期聚合：净值曲线要保留形态（回撤的深度与位置），
+    按时间聚合会改变局部极值。等距抽稀在这点上是中性的——它只丢分辨率。
+
+    刻意不做"保留极值点"的聪明抽稀：那会让抽稀后的曲线与 metrics 里的
+    max_drawdown 对不上（图上一个更深的谷），而这两个数字本应互相印证。
+    """
+    if not curve:
+        return []
+    try:
+        n = int(max_points)
+    except (TypeError, ValueError):
+        n = NET_CURVE_MAX_POINTS
+    if n <= 0 or len(curve) <= n:
+        return list(curve)
+    if n == 1:
+        return [curve[-1]]
+
+    # 等距取 n 个下标，首尾必取。用 (len-1) 而不是 len 做分母，末点才恰好命中。
+    span = len(curve) - 1
+    idxs: list[int] = []
+    for k in range(n):
+        i = round(k * span / (n - 1))
+        if not idxs or i != idxs[-1]:
+            idxs.append(i)
+    return [curve[i] for i in idxs]
+
+
 def _oos_backtest(code: str, name: str, test_start: str) -> dict:
     """单因子 qlib 回测（无 SOTA 拼接），test_start 可覆盖——OOS 与挖掘窗口共用
     train/valid 默认值（模板 2008-2014 / 2015-2016），仅 test 窗口不同（§6）。"""
@@ -673,12 +713,16 @@ def factor_oos_check(code: str, name: str) -> str:
             # 透传 traceback：因子失败的真实原因（如沙箱内存不足）之前被吞掉，
             # 只剩一句 "new factor 'x' failed"，完全无法自查（2026-09-15 实测）。
             return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
+                          "mining_net_curve": [], "oos_net_curve": [],
                           "error": f"mining-window backtest failed: {mining.get('error', '')}",
                           "traceback": mining.get("traceback", "")})
         oos = _oos_backtest(code, name, OOS_TEST_START)
         if not oos.get("ok"):
             return _json({"oos": {}, "mining": _pick_metrics(mining["metrics"]),
                           "decay": None, "ok": False,
+                          # 挖掘窗口成功了，曲线照样给出去 —— 有半张图总好过没有
+                          "mining_net_curve": _downsample_curve(mining.get("net_curve")),
+                          "oos_net_curve": [],
                           "error": f"oos-window backtest failed: {oos.get('error', '')}",
                           "traceback": oos.get("traceback", "")})
         m_ic = (mining["metrics"] or {}).get("IC")
@@ -690,11 +734,17 @@ def factor_oos_check(code: str, name: str) -> str:
             "oos": _pick_metrics(oos["metrics"]),
             "mining": _pick_metrics(mining["metrics"]),
             "decay": decay,
+            # 两条净值曲线（已抽稀）。qlib 本来就跑出了 report，此前只取了三元组
+            # metrics，曲线被丢掉。两个窗口画在同一张图上就是 decay 的可视化 ——
+            # 这也是把净值放在这里而不是别处的原因：它天然带着"两个窗口"的对比。
+            "mining_net_curve": _downsample_curve(mining.get("net_curve")),
+            "oos_net_curve": _downsample_curve(oos.get("net_curve")),
             "ok": True,
             "error": "",
         })
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
         return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
+                      "mining_net_curve": [], "oos_net_curve": [],
                       "error": "factor_oos_check worker exception",
                       "traceback": tb_module.format_exc()})
 
