@@ -256,3 +256,37 @@ def test_backtest_default_window_is_bounded():
     from factor_miner import factor_backtest as fb
     assert fb.WINDOW_DAYS > 0
     assert fb.WINDOW_DAYS == fw.WINDOW_DAYS, "两处窗口默认值分叉了"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# windows 路径的 provider_uri 注入（远程执行器模式下）
+#
+# `_render_windows_conf` 会**自己**把模板渲染一遍，再用产物当 conf_template 传给
+# run_backtest —— 而后者内部的 _render_conf 对"已无 Jinja 占位"的文本是 no-op。
+# 所以 provider_uri 必须在**这里**就注入：一旦这次渲染漏了它，后面再传也改不回来。
+#
+# 2026-09-19 生产实测：OOS 路径（唯一走 windows 的路径）渲染出
+# `~/.qlib/qlib_data/cn_data`，在执行器容器里那个路径是空的，qrun 报
+# `instrument: {'__DEFAULT_FREQ': '/app/.qlib/qlib_data/cn_data'} does not contain
+# data for day`；而同一因子走非 windows 路径 provider_uri 是对的。两条路径又要不一致
+# —— 和沙箱窗口化那个 bug 同一类形状。
+# ═══════════════════════════════════════════════════════════════════
+
+def test_render_windows_conf_injects_provider_uri(tmp_path):
+    """windows 路径必须把 provider_uri 渲染进去，而不是落回模板默认值。"""
+    import factor_worker as fw
+    out = fw._render_windows_conf(tmp_path, "full", {"test_start": "2021-01-01"},
+                                  "/qlib_data/cn_data")
+    text = out.read_text()
+    assert 'provider_uri: "/qlib_data/cn_data"' in text, \
+        "windows 渲染丢了 provider_uri —— OOS 会在执行器里找不到数据"
+    assert "~/.qlib/qlib_data/cn_data" not in text
+    # 窗口覆盖仍然生效
+    assert "2021-01-01" in text
+
+
+def test_render_windows_conf_defaults_to_template_when_uri_absent(tmp_path):
+    """不传 provider_uri 时保持模板默认值（本地行为不变）。"""
+    import factor_worker as fw
+    out = fw._render_windows_conf(tmp_path, "full", {"test_start": "2021-01-01"})
+    assert "~/.qlib/qlib_data/cn_data" in out.read_text()

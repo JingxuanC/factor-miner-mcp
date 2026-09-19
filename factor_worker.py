@@ -316,11 +316,19 @@ def _correlations(new_src: "fb.FactorSrc", sota_srcs: list, version: str,
     return out
 
 
-def _render_windows_conf(work_dir: Path, profile: str, windows: dict) -> Path:
+def _render_windows_conf(work_dir: Path, profile: str, windows: dict,
+                         provider_uri: str | None = None) -> Path:
     """把 Go cfg 的回测窗口注入 conf 模板。
 
     预渲染后的 yaml 作为 conf_template 传给 run_backtest——其内部 _render_conf
     对无 Jinja 占位的文本是 no-op，profile 覆盖已在此时合并。
+
+    **provider_uri 必须在这里就注入**：因为上面那句 no-op 是双向的 —— 一旦这里渲染
+    过一次、占位被替换掉，后面再传 provider_uri 也回天无力。漏掉它的后果实测过：
+    OOS 路径（唯一走 windows 的路径）把 provider_uri 落回模板默认的
+    `~/.qlib/qlib_data/cn_data`，在执行器容器里那个路径是空的，qrun 报
+    `instrument: {...} does not contain data for day` —— 而同一因子走非 windows
+    路径时 provider_uri 是对的。
     """
     from jinja2 import Template  # noqa: PLC0415 — 与 qlib 一样保持惰性导入
 
@@ -331,6 +339,8 @@ def _render_windows_conf(work_dir: Path, profile: str, windows: dict) -> Path:
     }
     ctx.update(fb.PROFILE_OVERRIDES.get(profile, {}))
     ctx.update({k: v for k, v in windows.items() if v})
+    if provider_uri:
+        ctx["provider_uri"] = provider_uri
     out = work_dir / "conf_windows.yaml"
     out.write_text(Template(fb.DEFAULT_CONF_TEMPLATE.read_text()).render(**ctx))
     return out
@@ -359,10 +369,13 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
     last_tb = ""
     any_ok = False
 
+    # 远程模式下 conf 的 qlib_init.provider_uri 必须指向**执行器**的挂载路径
+    remote_uri = (os.environ.get("FACTOR_EXECUTOR_PROVIDER_URI") or None
+                  if os.environ.get("FACTOR_EXECUTOR_URL", "").strip() else None)
     for nf in new_factors:
         new_src = fb.FactorSrc(name=nf["name"], code=nf["code"])
         work_dir = BACKTEST_ROOT / uuid.uuid4().hex
-        conf = (_render_windows_conf(work_dir, profile, windows)
+        conf = (_render_windows_conf(work_dir, profile, windows, remote_uri)
                 if windows else fb.DEFAULT_CONF_TEMPLATE)
         res = fb.run_backtest(
             sota_factors=sota_srcs,
@@ -376,8 +389,7 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
             execute=_executor_dispatch(work_dir, version),
             # 远程模式下 conf 的 qlib_init.provider_uri 必须指向**执行器**的挂载路径。
             # 本地模式不传，沿用模板默认值（行为不变）。
-            provider_uri=os.environ.get("FACTOR_EXECUTOR_PROVIDER_URI") or None
-            if os.environ.get("FACTOR_EXECUTOR_URL", "").strip() else None,
+            provider_uri=remote_uri,
         )
         _write_back_cache(sota_srcs + [new_src], version, work_dir)
         correlations[new_src.name] = _correlations(new_src, sota_srcs, version, work_dir)
