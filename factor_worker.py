@@ -466,29 +466,13 @@ def factor_backtest(sota: list, new_factors: list, profile: str = "full",
 
 
 def stage_h5_for_sandbox(data_h5: Path, job_dir: Path, window_days: int) -> Path:
-    """把 h5 按窗口截取后放进 job 目录，返回沙箱要读的路径。
+    """把 h5 按窗口截取后放进 job 目录 —— 委托给 fb.stage_h5_for_sandbox。
 
-    window_days <= 0 → 旧的 symlink 全量行为（联调/需要全历史时用）。
-    窗口是"最近 N 个交易日"，索引层级名沿用原文件的 ``datetime`` / ``instrument``，
-    HDF key 保持 ``data``（因子代码惯用 ``pd.read_hdf('daily_pv.h5')`` 单 key 读取）。
+    这里刻意**不再保留第二份实现**：历史上有两份（本文件一份、_exec_factor_worker
+    自己 inline 的 symlink 一份），而后者漏了窗口，导致回测路径永远喂全量、撞破
+    沙箱地址空间上限被 SIGKILL。单一实现是这次修复的核心。
     """
-    dst = job_dir / "daily_pv.h5"
-    if window_days <= 0:
-        dst.symlink_to(data_h5.resolve())
-        return dst
-
-    df = pd.read_hdf(data_h5, key="data")
-    try:
-        dts = df.index.get_level_values("datetime").unique().sort_values()
-    except (KeyError, AttributeError):
-        # 索引层级名不是预期结构：原样落盘，不做窗口（安全兜底）
-        df.to_hdf(dst, key="data", mode="w")
-        return dst
-    if len(dts) > window_days:
-        keep = set(dts[-window_days:])
-        df = df[df.index.get_level_values("datetime").isin(keep)]
-    df.to_hdf(dst, key="data", mode="w")
-    return dst
+    return fb.stage_h5_for_sandbox(data_h5, job_dir, window_days)
 
 
 def _run_factor_window(code: str, data_h5: Path,

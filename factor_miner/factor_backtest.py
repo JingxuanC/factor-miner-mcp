@@ -207,19 +207,53 @@ def _read_result_h5(job_dir: Path) -> pd.DataFrame:
     return _normalize_index(df)
 
 
+
+def stage_h5_for_sandbox(data_h5: Path, job_dir: Path, window_days: int) -> Path:
+    """把 h5 按窗口截取后放进 job 目录，返回沙箱要读的路径。
+
+    window_days <= 0 → symlink 全量（联调/需要全历史时显式选择）。
+    窗口是"最近 N 个交易日"，索引层级名沿用原文件的 ``datetime`` / ``instrument``，
+    HDF key 保持 ``data``（因子代码惯用 ``pd.read_hdf('daily_pv.h5')`` 单 key 读取）。
+
+    **本模块是这份逻辑的唯一实现**。历史上 factor_worker 里还有一份窗口化实现，
+    而 _exec_factor_worker 自己写了一句 `symlink_to(全量)` —— 两条路径行为不一致：
+    走回测的那条永远喂全量，于是撞破沙箱地址空间上限被 SIGKILL，且错误信息里
+    看不出任何"数据太大"的线索。重复实现是根因，所以只留一份。
+    """
+    dst = job_dir / "daily_pv.h5"
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    if window_days <= 0:
+        dst.symlink_to(Path(data_h5).resolve())
+        return dst
+
+    df = pd.read_hdf(data_h5, key="data")
+    try:
+        dts = df.index.get_level_values("datetime").unique().sort_values()
+    except (KeyError, AttributeError):
+        # 索引层级名不是预期结构：原样落盘，不做窗口（安全兜底）
+        df.to_hdf(dst, key="data", mode="w")
+        return dst
+    if len(dts) > window_days:
+        keep = set(dts[-window_days:])
+        df = df[df.index.get_level_values("datetime").isin(keep)]
+    df.to_hdf(dst, key="data", mode="w")
+    return dst
+
+
 def _exec_factor_worker(args: tuple) -> tuple[str, Optional[pd.DataFrame], str]:
     """进程池 worker（必须模块顶层以便 pickle）：沙箱执行 factor.py 并读回 result.h5。
 
     返回 (name, df_or_None, error_or_empty)。
     """
-    name, code, data_h5, job_dir, timeout = args
+    name, code, data_h5, job_dir, timeout, window_days = args
     job = Path(job_dir)
     try:
         job.mkdir(parents=True, exist_ok=True)
-        link = job / "daily_pv.h5"  # factor.py 契约：读同目录 daily_pv.h5
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to(Path(data_h5).resolve())
+        # factor.py 契约：读同目录 daily_pv.h5。
+        # **必须走 stage_h5_for_sandbox**（窗口截取）—— 这里曾经直接 symlink 全量，
+        # 于是沙箱读 1500 万行、顶破 RLIMIT_AS 被 SIGKILL（exit -9）。
+        stage_h5_for_sandbox(data_h5, job, window_days)
         res = sandbox.run_factor_source(code, str(job), timeout=timeout)
         if res.returncode != 0 or not (job / "result.h5").exists():
             err = res.violation or (res.stderr or res.stdout or f"exit {res.returncode}")
@@ -266,6 +300,15 @@ def _pick(metrics: dict, *keys: str) -> Optional[float]:
 
 
 # 买卖点导出上限（TopkDropout 每日调仓，多年全市场回防 JSON 膨胀）
+# 沙箱输入窗口（交易日）。与 factor_worker.WINDOW_DAYS 同一个 env、同一个默认值 ——
+# 但定义在这里，因为**沙箱暂存发生在本模块**（stage_h5_for_sandbox）。
+#
+# 为什么必须是窗口而不是全量：daily_pv_all.h5 约 1500 万行，而沙箱上的是
+# RLIMIT_AS **硬**上限（sandbox.MAX_AS_BYTES，默认 4GiB，虚拟地址空间含 mmap）。
+# 全量读 + pandas 中间结果会顶破它 → 子进程直接 SIGKILL（`exit -9`），
+# 表现为 "new factor 'x' failed"，真正的原因完全看不出来。
+WINDOW_DAYS = int(os.environ.get("FACTOR_MINER_WINDOW_DAYS", "400") or 0)
+
 MAX_TRADES = 5000
 
 
@@ -376,6 +419,7 @@ def run_backtest(
     version: str | None = None,
     execute: Callable[[Path, Path, int, str | None], dict] | None = None,
     provider_uri: str | None = None,
+    window_days: int | None = None,
 ) -> BacktestResult:
     """跑一轮 qlib 回测。失败语义见模块 docstring。
 
@@ -387,6 +431,9 @@ def run_backtest(
     签名 `(work_dir, conf_path, timeout, version) -> dict`，返回统一 outcome
     （成功 `{ok: True, metrics, net_values, trades}`，失败 `{ok: False, error, traceback}`）。
 
+    window_days：喂给沙箱的行情窗口（交易日）。None = WINDOW_DAYS（400）。
+    0 = symlink 全量，仅联调/确需全历史时用 —— 全量会顶破沙箱 RLIMIT_AS 被 SIGKILL。
+
     provider_uri：渲染 conf 时写进 qlib_init 的数据路径。None = 沿用模板自带值。
     拆出执行器后必须传执行器自己的挂载路径 —— 否则远端 qrun 会去找一个不存在的
     路径，或在更糟的情况下读到另一份数据。
@@ -395,6 +442,8 @@ def run_backtest(
     data_h5 = Path(data_h5)
     factors_dir = work_dir / "factors"
     work_dir.mkdir(parents=True, exist_ok=True)
+    # 沙箱输入窗口：调用方可覆盖，默认取 WINDOW_DAYS（400 交易日）
+    window_days = WINDOW_DAYS if window_days is None else window_days
 
     # ── Step 1: 进程池重执行（逐因子 exec_cache 命中则跳过）──
     version = version or data_version(data_h5)
@@ -413,7 +462,8 @@ def run_backtest(
 
     if misses:
         jobs = [
-            (f.name, f.code, str(data_h5), str(factors_dir / f.name), factor_timeout)
+            (f.name, f.code, str(data_h5), str(factors_dir / f.name), factor_timeout,
+             window_days)
             for _, f in misses
         ]
         results: dict[str, tuple[Optional[pd.DataFrame], str]] = {}

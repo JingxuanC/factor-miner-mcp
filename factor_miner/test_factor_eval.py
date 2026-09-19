@@ -181,3 +181,78 @@ def test_window_days_default_is_bounded():
     import factor_worker as fw
     assert fw.WINDOW_DAYS > 0
     assert fw.WINDOW_DAYS <= 1000
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 回测路径的沙箱暂存（_exec_factor_worker）
+#
+# 上面那组用例覆盖的是 factor_worker.stage_h5_for_sandbox —— 它们全绿，却漏掉了
+# 真正的故障：_exec_factor_worker 曾经自己 inline 一句
+#     link.symlink_to(Path(data_h5).resolve())
+# 不走窗口截取，于是**回测路径永远喂全量**。全量读 + pandas 中间结果顶破沙箱的
+# RLIMIT_AS **硬**上限（sandbox.MAX_AS_BYTES，默认 4GiB，虚拟地址空间含 mmap），
+# 子进程被 SIGKILL，调用方只看到一句 `exit -9` / "new factor 'x' failed"。
+#
+# 2026-09-19 生产实测：factor_oos_check 8 秒失败、exit -9、qrun 根本没启动，
+# 而同一因子走窗口截取的路径只要 1166MiB 就轻松跑通。两条路径行为不一致就是根因，
+# 所以这里钉住"回测路径也必须窗口化"。
+# ═══════════════════════════════════════════════════════════════════
+
+def test_exec_factor_worker_stages_a_window_not_the_full_symlink(tmp_path):
+    """回测路径必须走窗口截取：暂存文件是真实文件、行数受窗口约束。"""
+    pytest.importorskip("tables")
+    import pandas as pd
+    from factor_miner.factor_backtest import _exec_factor_worker
+
+    src = tmp_path / "daily_pv_all.h5"
+    df = _mk_pv(120)                     # 120 个交易日
+    df.to_hdf(src, key="data", mode="w")
+
+    job = tmp_path / "job"
+    code = (
+        "import pandas as pd\n"
+        "df = pd.read_hdf('daily_pv.h5', key='data')\n"
+        "s = df['$close'].sort_index()\n"
+        "f = s.groupby(level='instrument').pct_change(2)\n"
+        "f.name = 'factor'\n"
+        "f.to_frame().to_hdf('result.h5', key='data')\n"
+    )
+    name, out_df, err = _exec_factor_worker(
+        ("probe", code, str(src), str(job), 120, 30))   # window_days=30
+
+    assert err == "", err
+    assert out_df is not None and not out_df.empty
+    staged = job / "daily_pv.h5"
+    assert not staged.is_symlink(), \
+        "回测路径又变回 symlink 全量了 —— 这正是被 SIGKILL 的那条路"
+    assert staged.is_file()
+    # 窗口之外的日期不应出现（120 天数据只留尾部 30 天）
+    kept = out_df.index.get_level_values("datetime").nunique()
+    assert 0 < kept <= 30, kept
+
+
+def test_exec_factor_worker_accepts_window_zero_for_full_history(tmp_path):
+    """window_days=0 是显式的"要全历史"，此时才允许 symlink。"""
+    pytest.importorskip("tables")
+    from factor_miner.factor_backtest import _exec_factor_worker
+
+    src = tmp_path / "daily_pv_all.h5"
+    _mk_pv(40).to_hdf(src, key="data", mode="w")
+    job = tmp_path / "job"
+    code = (
+        "import pandas as pd\n"
+        "df = pd.read_hdf('daily_pv.h5', key='data')\n"
+        "df['$close'].to_frame('factor').to_hdf('result.h5', key='data')\n"
+    )
+    name, out_df, err = _exec_factor_worker(
+        ("probe", code, str(src), str(job), 120, 0))
+    assert err == "", err
+    assert (job / "daily_pv.h5").is_symlink()
+
+
+def test_backtest_default_window_is_bounded():
+    """回测模块的默认窗口也必须有界，且与 factor_worker 同源同值。"""
+    import factor_worker as fw
+    from factor_miner import factor_backtest as fb
+    assert fb.WINDOW_DAYS > 0
+    assert fb.WINDOW_DAYS == fw.WINDOW_DAYS, "两处窗口默认值分叉了"
