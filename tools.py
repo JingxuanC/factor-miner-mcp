@@ -132,6 +132,34 @@ def factor_recent_ic(code: str, name: str, lookback_days: int = 60) -> str:
     return _impl(code, name, lookback_days)
 
 
+@tool("factor_evaluate", "One-call professional factor evaluation: run factor.py in the sandbox "
+      "and return the alphalens-style tearsheet for it — no need to supply factor_values/klines "
+      "yourself (this is the difference from factor_tearsheet, and why it closes the code→metrics "
+      "gap that factor_execute leaves open with its contract check only). Factor values and close "
+      "prices come from the same window slice, so they are exactly aligned. Adds a professional "
+      "summary: per-period quantile monotonicity (strict, plus Spearman rho), IC decay half-life in "
+      "trading days (decides holding period), IC t-stat, and a hypothesis passthrough that flags a "
+      "missing economic hypothesis. "
+      "Returns JSON string: {ok, error, tearsheet, monotonicity, ic_half_life_days, ic_t_stat, "
+      "hypothesis, hypothesis_missing, dataset, window_days, n_dates, n_symbols, eval_window}.",
+      {"code": {"type": "string", "description": "factor.py source code (sandbox: import whitelist, rlimit, 120s timeout)"},
+       "hypothesis": {"type": "string", "description": "Economic hypothesis (the professional gate); "
+                                                       "absent → hypothesis_missing=true, metrics still returned"},
+       "quantiles": {"type": "integer", "description": "Number of quantile buckets (default 5)", "default": 5},
+       "periods": {"type": "array", "description": "Forward return periods in trading days (default [1,5,10], max 120)",
+                   "default": [1, 5, 10]},
+       "dataset": {"type": "string", "enum": ["full", "debug"],
+                   "description": "full = daily_pv_all.h5 windowed to FACTOR_MINER_WINDOW_DAYS; debug = small static set",
+                   "default": "full"},
+       "window_days": {"type": "integer", "description": "Override the trailing trading-day window (0 = full history)"}},
+      required=["code"])
+def factor_evaluate(code: str, hypothesis: str = "", quantiles: int = 5,
+                    periods: Optional[list] = None, dataset: str = "full",
+                    window_days: int = None) -> str:
+    from factor_worker import factor_evaluate as _impl
+    return _impl(code, hypothesis, quantiles, periods, dataset, window_days)
+
+
 # ═══════════════════════════════════════════════════════════════
 # 纯 pandas 扩展工具（无 qlib 依赖）
 # ═══════════════════════════════════════════════════════════════

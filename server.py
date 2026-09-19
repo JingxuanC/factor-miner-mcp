@@ -18,7 +18,7 @@
     环境变量 MCP_LICENSE_FILE 指向 license JSON 时强制鉴权
     （请求头 X-License-Key）；未配置 = 开放模式（本地/内网）。
     重负载工具（factor_execute/factor_backtest/factor_oos_check/
-    factor_daily_compute）提交即入队返回 job_id，客户端轮询
+    factor_daily_compute/factor_evaluate）提交即入队返回 job_id，客户端轮询
     /jobs/<id> 拿结果。
 """
 
@@ -44,7 +44,7 @@ VERSION = "1.0.0"
 
 # 重负载工具：提交后入异步队列执行（返回 job_id 轮询），不占 HTTP 连接。
 ASYNC_TOOLS = {"factor_execute", "factor_backtest", "factor_oos_check", "factor_daily_compute",
-               "ml_train_rolling", "update_data"}
+               "factor_evaluate", "ml_train_rolling", "update_data"}
 
 # 异步任务查询工具（不走 HANDLERS，在 _handle_mcp 里特殊处理；查状态不扣额度）
 JOB_STATUS_SCHEMA = {

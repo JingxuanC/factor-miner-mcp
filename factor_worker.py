@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -737,3 +738,222 @@ def factor_recent_ic(code: str, name: str,
         return _json({"ok": False, "ic": None, "days": 0,
                       "error": "factor_recent_ic worker exception",
                       "traceback": tb_module.format_exc()})
+
+
+# ═══════════════ 因子专业评估：代码 → 专业指标（一条链） ═══════════════
+#
+# 为什么需要它：`factor_execute` 只回契约检查 {eval_ok, eval_detail}，
+# `factor_tearsheet` 需要调用方自带 factor_values + klines。两者之间**没有
+# 任何工具能把一段因子代码变成专业指标** —— 因子看板因此卡住。
+# factor_evaluate 就是把仓库里已有的两块接起来：沙箱跑代码（
+# `_run_factor_window`，因子值与收盘价取自**同一次窗口切片**）+ 同仓库的
+# `analytics.factor_tearsheet`（alphalens 口径）。不是新造能力。
+
+EVAL_PERIOD_MAX = 120  # 持有期上限（交易日）；超过它 IC/分层都不再有统计意义
+
+
+def _period_to_days(key) -> int | None:
+    """"5d" → 5；无法解析返回 None（不抛，外部字典可能带任意键）。"""
+    try:
+        return int(str(key).rstrip("ds").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def quantile_monotonicity(q_mean: dict, quantiles: int) -> dict:
+    """分层收益单调性（q1..qQ 的均值序列）。
+
+    专业口径里"单调"是**严格**判断，rho 只表示趋势强度，两者分开报 ——
+    把 rho=0.9 的"几乎单调"说成单调，正是因子评估最常见的自欺。
+
+    返回 ``{rho, direction, monotonic, values}``；任一档位缺失（None）时
+    三项均为 None/unknown，不猜。
+    """
+    empty = {"rho": None, "direction": "unknown", "monotonic": None, "values": None}
+    if not isinstance(q_mean, dict) or quantiles < 2:
+        return empty
+    vals = [q_mean.get(f"q{q}") for q in range(1, int(quantiles) + 1)]
+    if any(v is None for v in vals):
+        return empty
+    vals = [float(v) for v in vals]
+    rho = None
+    try:
+        from scipy import stats as _stats  # noqa: PLC0415 — 与 analytics 同款惰性导入
+
+        rho = float(_stats.spearmanr(range(1, len(vals) + 1), vals).statistic)
+        if not math.isfinite(rho):
+            rho = None
+    except Exception:  # noqa: BLE001 — rho 只是强度指标，算不出不影响主结论
+        rho = None
+    inc = all(a < b for a, b in zip(vals, vals[1:]))
+    dec = all(a > b for a, b in zip(vals, vals[1:]))
+    direction = "increasing" if inc else ("decreasing" if dec else "non_monotonic")
+    return {"rho": rho, "direction": direction,
+            "monotonic": bool(inc or dec), "values": vals}
+
+
+def ic_half_life(decay: dict) -> float | None:
+    """IC 衰减半衰期（交易日）：|IC| 从最短持有期跌到其一半所需期数，线性插值。
+
+    输入是 tearsheet 的 ``ic.decay``，如 ``{"1d": 0.064, "5d": 0.041, "10d": 0.022}``。
+    半衰期决定**持有期**，比 IC 均值更能说明因子能不能用（§7 四张图的第 2 张）。
+    未跌到一半（长周期 IC 反而更高）返回 None —— 那是噪声不是衰减，不插值。
+    """
+    items = []
+    for k, v in (decay or {}).items():
+        p = _period_to_days(k)
+        if p is None or v is None or p <= 0:
+            continue
+        items.append((p, abs(float(v))))
+    if len(items) < 2:
+        return None
+    items.sort()
+    p0, v0 = items[0]
+    if v0 <= 0:
+        return None
+    half = v0 / 2.0
+    for i in range(1, len(items)):
+        p_prev, v_prev = items[i - 1]
+        p, v = items[i]
+        if v <= half:
+            span = v_prev - v
+            if span <= 0:
+                return float(p)
+            return float(p_prev + (p - p_prev) * (v_prev - half) / span)
+    return None
+
+
+def ic_t_stat(ic_mean, ic_std, days) -> float | None:
+    """IC 的 t 统计量 = mean/std × sqrt(N)（N = 截面 IC 的交易日数）。
+
+    没有它就只能看 IC 均值大小 —— 机构评审先看显著性再看大小（§7 的「t 2.41 ✅」）。
+    """
+    if ic_mean is None or ic_std is None or days is None:
+        return None
+    ic_std, days = float(ic_std), int(days)
+    if ic_std <= 0 or days < 2:
+        return None
+    return float(ic_mean) / ic_std * math.sqrt(days)
+
+
+def _eval_periods(periods: list | None) -> list[int]:
+    """持有期入参归一化：正整数、去重、升序、上限 EVAL_PERIOD_MAX；空则 [1,5,10]。"""
+    out = []
+    for p in (periods or [1, 5, 10]):
+        try:
+            days = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= days <= EVAL_PERIOD_MAX and days not in out:
+            out.append(days)
+    return sorted(out) or [1, 5, 10]
+
+
+def factor_evaluate(code: str, hypothesis: str = "", quantiles: int = 5,
+                    periods: list | None = None, dataset: str = "full",
+                    window_days: int | None = None) -> str:
+    """沙箱跑一段因子代码 → **直接**返回 alphalens 口径的专业评估（一条链）。
+
+    与 ``factor_execute`` 的区别：那个只回契约检查（eval_ok/eval_detail），
+    这个回**专业指标**；与 ``factor_tearsheet`` 的区别：那个要调用方自带
+    factor_values + klines，这个自带数据。
+
+    关键实现点：因子值与收盘价取自 ``_run_factor_window`` 的**同一次窗口切片**，
+    因此两者天然对齐（不需要事后 intersect，也不会出现日期轴错位）；且只整读
+    一次 h5（Fixed 格式无法部分读，两次整读会把容器 OOM 掉，见该函数说明）。
+
+    ``hypothesis``（经济假设）只做**透传 + 缺失标记**，不硬失败：专业看板要求
+    假设必填（§4），但"必填"是入库闸门，不该让一次评估拿不到指标。
+
+    返回 JSON 字符串，**永不抛异常**：
+    ``{ok, error, tearsheet, monotonicity, ic_half_life_days, ic_t_stat,
+       hypothesis, hypothesis_missing, dataset, window_days, n_dates, n_symbols,
+       eval_window, quantiles, periods}``
+    """
+    periods = _eval_periods(periods)
+    try:
+        quantiles = max(2, int(quantiles))
+    except (TypeError, ValueError):
+        quantiles = 5
+    debug = str(dataset).lower() == "debug"
+    data_h5 = DATA_DIR / ("daily_pv_debug.h5" if debug else "daily_pv_all.h5")
+    window = 0 if debug else (WINDOW_DAYS if window_days is None else int(window_days))
+    window = max(0, int(window))
+
+    ctx = {
+        "hypothesis": hypothesis or "",
+        "hypothesis_missing": not (hypothesis or "").strip(),
+        "dataset": "debug" if debug else "full",
+        "window_days": window,
+        "quantiles": quantiles,
+        "periods": periods,
+    }
+
+    if not data_h5.exists():
+        return _json({**ctx, "ok": False, "error": f"data file missing: {data_h5}",
+                      "tearsheet": None, "monotonicity": {}, "ic_half_life_days": None,
+                      "ic_t_stat": None, "n_dates": 0, "n_symbols": 0, "eval_window": {}})
+
+    # ── 1. 沙箱执行（复用 factor_execute 的执行路径，含白名单 + rlimit + 超时）──
+    try:
+        fac, close = _run_factor_window(code, data_h5, window)
+    except Exception as e:  # noqa: BLE001 — 沙箱失败要连 stderr/traceback 一起回
+        return _json({**ctx, "ok": False, "error": f"factor execution failed: {e}",
+                      "traceback": tb_module.format_exc(), "tearsheet": None,
+                      "monotonicity": {}, "ic_half_life_days": None, "ic_t_stat": None,
+                      "n_dates": 0, "n_symbols": 0, "eval_window": {}})
+
+    try:
+        # panel 契约把 close/c/price/**value** 都当价格列；result.h5 的列名是
+        # "factor"，不在别名里，改名成 close 才能被 as_dataframe 接受。
+        fac_df = fac.rename("close").reset_index()
+        px_df = close.rename("close").reset_index()
+        del fac, close
+        fac_df = fac_df.dropna(subset=["close"])
+        px_df = px_df.dropna(subset=["close"])
+        n_dates = int(fac_df["datetime"].nunique())
+        n_symbols = int(fac_df["instrument"].nunique())
+        dts = sorted(fac_df["datetime"].unique())
+        ctx["n_dates"], ctx["n_symbols"] = n_dates, n_symbols
+        ctx["eval_window"] = ({
+            "start": pd.Timestamp(dts[0]).strftime("%Y-%m-%d"),
+            "end": pd.Timestamp(dts[-1]).strftime("%Y-%m-%d"),
+        } if dts else {})
+
+        # ── 2. 专业评估（同仓库既有实现，不重写因子分析）──
+        # 直接传 DataFrame（panel 契约接受）：全量窗口 ~2.4M 行，转 dict-records
+        # 的对象开销会 OOM，而这里根本不需要走 JSON。
+        import analytics  # noqa: PLC0415 — scipy/numpy 惰性导入，未装也能 import 本模块
+
+        raw = analytics.factor_tearsheet(fac_df, px_df, quantiles, periods)
+        del fac_df, px_df
+    except Exception:  # noqa: BLE001 — tool 通道永不抛异常
+        return _json({**ctx, "ok": False, "error": "factor_evaluate worker exception",
+                      "traceback": tb_module.format_exc(), "tearsheet": None,
+                      "monotonicity": {}, "ic_half_life_days": None, "ic_t_stat": None})
+
+    tear = json.loads(raw)
+    if "error" in tear:
+        # tearsheet 自己走 error 分支（样本不足/形状无法解析）—— 透传原因，
+        # 否则上层只能看到"评估失败的评估"，与 §7 说的静默失败同源。
+        return _json({**ctx, "ok": False, "error": tear["error"], "tearsheet": None,
+                      "monotonicity": {}, "ic_half_life_days": None, "ic_t_stat": None})
+
+    # ── 3. 专业摘要层（单调性 / 半衰期 / t 值）──
+    monotonicity = {
+        p: quantile_monotonicity(
+            ((tear.get("quantile_returns") or {}).get(p) or {}).get("mean_period_return"),
+            quantiles)
+        for p in tear.get("quantile_returns") or {}
+    }
+    ic = tear.get("ic") or {}
+    return _json({
+        **ctx,
+        "ok": True,
+        "error": "",
+        "tearsheet": tear,
+        "monotonicity": monotonicity,
+        "ic_half_life_days": ic_half_life(ic.get("decay") or {}),
+        "ic_t_stat": ic_t_stat(
+            ic.get("mean"), ic.get("std"), (ic.get("series_summary") or {}).get("days")),
+    })
