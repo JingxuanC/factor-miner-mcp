@@ -374,6 +374,10 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
             profile=profile,
             version=version,  # 复用本函数已算的数据版本，避免重复计算
             execute=_executor_dispatch(work_dir, version),
+            # 远程模式下 conf 的 qlib_init.provider_uri 必须指向**执行器**的挂载路径。
+            # 本地模式不传，沿用模板默认值（行为不变）。
+            provider_uri=os.environ.get("FACTOR_EXECUTOR_PROVIDER_URI") or None
+            if os.environ.get("FACTOR_EXECUTOR_URL", "").strip() else None,
         )
         _write_back_cache(sota_srcs + [new_src], version, work_dir)
         correlations[new_src.name] = _correlations(new_src, sota_srcs, version, work_dir)
@@ -416,9 +420,10 @@ def _executor_dispatch(work_dir: Path, version: str | None):
     只搬「执行」这一步：Step 1–3（沙箱跑因子、去重闸门、拼 combined_factors）
     留在本地，它们本来就是轻的，而且依赖面板归一化与 exec_cache。
 
-    conf 现在是**本地渲染好再传**的（`fb._render_conf` 已把 provider_uri 渲染进去）。
-    远程模式下 `_render_conf` 仍用模板里的 provider_uri —— 所以执行器与本地必须
-    看到同一份 qlib 数据；这由启动时的版本校验兜底（见 client/data_version）。
+    conf 由本地渲染后传给执行器，其中 `qlib_init.provider_uri` 来自
+    `FACTOR_EXECUTOR_PROVIDER_URI`（执行器容器内的挂载路径）—— 两边必须指向
+    同一份数据。执行器侧的**面板版本校验**是兜底：不一致就拒绝执行，而不是
+    读另一份数据静默跑出偏掉的结果。
     """
     url = os.environ.get("FACTOR_EXECUTOR_URL", "").strip()
     if not url:

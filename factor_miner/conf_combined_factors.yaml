@@ -7,7 +7,9 @@
 #   - Jinja 占位沿用上游 var|default(...) 风格，但由 factor_backtest.py 在
 #     Python 侧预渲染——不依赖 qrun 的 env-var 机制。
 qlib_init:
-    provider_uri: "~/.qlib/qlib_data/cn_data"
+    # 由 factor_backtest._render_conf 的 jinja 上下文注入：本地默认 ~/.qlib/...
+    # 拆出执行器之后，python 侧的 --provider-uri 会把它指到执行器自己的挂载路径。
+    provider_uri: "{{ provider_uri | default('~/.qlib/qlib_data/cn_data', true) }}"
     region: cn
 
 market: &market {{ market | default("csi300", true) }}

@@ -238,7 +238,8 @@ def _daily_ic(a: pd.Series, b: pd.Series) -> float:
     return float(ics.mean()) if len(ics) else 0.0
 
 
-def _render_conf(template_path: Path, out_path: Path, profile: str) -> None:
+def _render_conf(template_path: Path, out_path: Path, profile: str,
+                 provider_uri: str | None = None) -> None:
     """Jinja2 预渲染 conf 模板（不用 qrun env-var 机制，spec §6 评审修订）。"""
     from jinja2 import Template  # noqa: PLC0415 — 与 qlib 一样保持模块可独立 import
 
@@ -248,6 +249,11 @@ def _render_conf(template_path: Path, out_path: Path, profile: str) -> None:
         "feature_names": str(list(ALPHA20.keys())),
     }
     ctx.update(PROFILE_OVERRIDES[profile])
+    # provider_uri 可注入：默认沿用模板自带值（本地行为不变），拆出执行器后由
+    # --provider-uri 指向执行器容器里的挂载路径。**必须两边同源**，否则回测会读
+    # 到另一份数据而静默偏掉 —— 执行器侧另有面板版本校验兜底。
+    if provider_uri:
+        ctx["provider_uri"] = provider_uri
     rendered = Template(template_path.read_text()).render(**ctx)
     out_path.write_text(rendered)
 
@@ -369,6 +375,7 @@ def run_backtest(
     n_proc: int = 4,
     version: str | None = None,
     execute: Callable[[Path, Path, int, str | None], dict] | None = None,
+    provider_uri: str | None = None,
 ) -> BacktestResult:
     """跑一轮 qlib 回测。失败语义见模块 docstring。
 
@@ -379,6 +386,10 @@ def run_backtest(
     传入可调用对象则交给它 —— factor_executor 就是用它把 qrun 搬到独立进程/机器上。
     签名 `(work_dir, conf_path, timeout, version) -> dict`，返回统一 outcome
     （成功 `{ok: True, metrics, net_values, trades}`，失败 `{ok: False, error, traceback}`）。
+
+    provider_uri：渲染 conf 时写进 qlib_init 的数据路径。None = 沿用模板自带值。
+    拆出执行器后必须传执行器自己的挂载路径 —— 否则远端 qrun 会去找一个不存在的
+    路径，或在更糟的情况下读到另一份数据。
     """
     work_dir = Path(work_dir)
     data_h5 = Path(data_h5)
@@ -458,7 +469,7 @@ def run_backtest(
     # 产出同一套 (metrics, net_values, trades)，否则同一个因子在本地与远程会给出
     # 不同指标，而这种分叉几乎不可能被发现。
     conf_path = work_dir / "conf.yaml"
-    _render_conf(Path(conf_template), conf_path, profile)
+    _render_conf(Path(conf_template), conf_path, profile, provider_uri)
     if execute is None:
         outcome = execute_local(work_dir, timeout)
     else:
