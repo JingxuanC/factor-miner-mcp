@@ -222,7 +222,7 @@ factor-executor:
     EXECUTOR_JOB_ROOT: /work
     EXECUTOR_QLIB_ROOT: /qlib_data
     EXECUTOR_PANEL_H5: /data/factor_mining/daily_pv_all.h5
-    EXECUTOR_MEM_LIMIT_MB: "4096"    # qrun 子进程的 RLIMIT_AS
+    EXECUTOR_MEM_LIMIT_MB: "7168"    # qrun 子进程的 RLIMIT_AS（见下方实测）
     EXECUTOR_TIMEOUT: "1800"
   volumes:
     - ./backtests:/work                       # 与 miner 同挂同一宿主目录
@@ -240,6 +240,25 @@ miner 侧对应加 `FACTOR_EXECUTOR_URL=http://factor-executor:50054`，并把
 **失败隔离**：每个 job 一个独立会话/进程组，超时或失败都按**组**收割（`killpg`），
 不会再留孤儿；`-9` 会被翻译成"很可能是内存不足"的提示。执行器崩了不影响 miner
 的其它工具。
+
+### qrun 要多少内存（生产实测，别再按猜的值配）
+
+`factor_oos_check` 走 full profile = **`market: csi300` + `start_time 2008` + `test_end null`**，
+也就是全量 csi300 跨十余年的 Alpha158 特征 + LGBM 训练 + 组合回测。在这台机器
+（7.4G 总内存）上实测：
+
+| 配置 | 结果 |
+|---|---|
+| `RLIMIT_AS = 5120 MiB` | **失败** —— qrun 90s 后 `MemoryError: Unable to allocate 80.0 MiB`；申请 80MiB 都失败说明是**地址空间**耗尽，不是机器没内存 |
+| `RLIMIT_AS` 不限，容器 10 GiB | 成功，cgroup 峰值 **3783 MiB** |
+| `RLIMIT_AS = 7168 MiB` + 容器 `mem_limit: 8192m` | **成功**，cgroup 峰值 **3581 MiB**（留约 2× 余量） |
+
+**要注意的是虚拟地址空间，不是 RSS**：5120 MiB 的 RAS 都过不去，而实际 RSS 只有
+~3.6 GiB —— qlib/pandas 的 mmap 与中间对象让 VA 明显高于常驻。所以这个上限不能照着
+"RSS × 1.2" 去设。
+
+`mem_limit` 与 `RLIMIT_AS` 刻意都设、且 `RLIMIT_AS < mem_limit`：前者是容器护栏，
+后者让 qrun 先于容器被自己杀掉（不会拖累执行器进程本身）。
 
 相关测试：`test_factor_executor.py`（用假 qrun 驱动，不需要 pyqlib，本机可跑）。
 
