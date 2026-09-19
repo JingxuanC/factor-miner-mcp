@@ -59,6 +59,14 @@ from factor_executor.parse import read_exp_res
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("factor-executor")
 
+# mlflow >= 3.12 把文件系统 tracking backend（./mlruns —— qlib Recorder 的默认）列为
+# 维护模式，不设这个变量就直接抛 MlflowException，qrun 连 recorder 都建不起来。
+#
+# 本地路径靠 `factor_miner/factor_backtest.py` 的模块级 setdefault 生效（qrun 子进程
+# 继承父进程环境）；**执行器不 import 那个模块**，所以必须自己设一份 —— 实测漏掉这条
+# 时 qrun 退出码 1，报 "The filesystem tracking backend ... is in maintenance mode"。
+os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+
 # job 目录的**容器内**根路径。它必须是 miner 与执行器共同挂载的宿主机目录，
 # 否则请求里带的路径在执行器侧不存在。
 JOB_ROOT = Path(os.environ.get("EXECUTOR_JOB_ROOT", "/work"))
