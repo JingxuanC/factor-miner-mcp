@@ -111,7 +111,29 @@ def positions_to_trades(positions: dict) -> list[dict]:
     return trades
 
 
-def read_exp_res(work_dir: Path, provider_uri: str) -> tuple[dict, list[float], list[dict]]:
+def _recorder_run_id(recorder) -> str | None:
+    """取 recorder 的 mlflow run id（归因用：让调用方能按 run 取指标，
+    而不是"取最新 recorder"）。qlib 的 Recorder 暴露 .id；不同版本字段名不一，
+    这里逐个兜底，取不到就返回 None（绝不因此让回测失败）。"""
+    for attr in ("id", "run_id"):
+        try:
+            val = getattr(recorder, attr)
+            if val:
+                return str(val)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        info = recorder.info
+        if isinstance(info, dict):
+            for key in ("run_id", "id"):
+                if info.get(key):
+                    return str(info[key])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def read_exp_res(work_dir: Path, provider_uri: str) -> tuple[dict, list[float], list[dict], list[dict], str | None]:
     """解析 qrun 产物：最新 recorder → metrics + 组合净值 + 买卖点标记。
 
     与 factor_backtest.read_exp_res 同口径，唯一差异是 **provider_uri 必须显式传入**
@@ -177,4 +199,4 @@ def read_exp_res(work_dir: Path, provider_uri: str) -> tuple[dict, list[float], 
         trades = positions_to_trades(dict(positions))
     except Exception as exc:  # noqa: BLE001 — 持仓产物缺失/损坏不阻塞主结果
         logger.debug("positions unavailable, trades left empty: %s", exc)
-    return metrics, [float(v) for v in net], trades, _net_curve(report)
+    return metrics, [float(v) for v in net], trades, _net_curve(report), _recorder_run_id(latest_recorder)
