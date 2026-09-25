@@ -319,7 +319,9 @@ def _correlations(new_src: "fb.FactorSrc", sota_srcs: list, version: str,
 
 
 def _render_windows_conf(work_dir: Path, profile: str, windows: dict,
-                         provider_uri: str | None = None) -> Path:
+                         provider_uri: str | None = None,
+                         template: Path | None = None,
+                         spec: dict | None = None) -> Path:
     """把 Go cfg 的回测窗口注入 conf 模板。
 
     预渲染后的 yaml 作为 conf_template 传给 run_backtest——其内部 _render_conf
@@ -341,18 +343,98 @@ def _render_windows_conf(work_dir: Path, profile: str, windows: dict,
     }
     ctx.update(fb.PROFILE_OVERRIDES.get(profile, {}))
     ctx.update({k: v for k, v in windows.items() if v})
+    # 类型化 BacktestSpec 优先级最高（显式意图 > 档位预设 > 调用方窗口）
+    ctx.update(fb.spec_to_ctx(spec))
     if provider_uri:
         ctx["provider_uri"] = provider_uri
     out = work_dir / "conf_windows.yaml"
-    out.write_text(Template(fb.DEFAULT_CONF_TEMPLATE.read_text()).render(**ctx))
+    out.write_text(Template((template or fb.DEFAULT_CONF_TEMPLATE).read_text()).render(**ctx))
     return out
 
 
-def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | None) -> dict:
+def _classify_error(error: str, tb: str = "") -> tuple[str, bool]:
+    """把失败文本归成 (error_code, retryable)。
+
+    为什么需要：现在的失败是自然语言（"worker exception" / "new factor 'ma_5' failed"），
+    agent 无法据此决定"重试 / 换参数 / 放弃"。有了码与 retryable，调用方才能自愈。
+    """
+    blob = f"{error}\n{tb}".lower()
+    if "memoryerror" in blob or "unable to allocate" in blob or "sigkill" in blob:
+        return "ENGINE_MEMORY", True          # 降窗口 / 降档可重试
+    if "timeout" in blob or "timed out" in blob:
+        return "TIMEOUT", True
+    if "data file missing" in blob or "does not contain data for day" in blob:
+        return "DATA_MISSING", False
+    if "no recorders found" in blob or "failed to parse qrun output" in blob:
+        return "ENGINE_ERROR", True
+    if "bad_spec" in blob:
+        return "BAD_SPEC", False
+    if "dropped" in blob and "ic" in blob:
+        return "DEDUP_DROPPED", True          # 建议换方向，而不是重跑同一个因子
+    if "factor" in blob and "failed" in blob:
+        return "FACTOR_CODE_FAILED", True     # 因子代码本身跑不过（可改代码重试）
+    return "ENGINE_ERROR", True
+
+
+def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | None,
+                  baseline: bool = False, spec: dict | None = None,
+                  allow_stale: bool = False) -> dict:
     data_h5 = DATA_DIR / "daily_pv_all.h5"  # 回测永远跑全量数据（§6）
     if not data_h5.exists():
         raise FileNotFoundError(f"data file missing: {data_h5}")
     version = fb.data_version(data_h5)
+
+    # 归因字段：随结果一起返回，由 run_ledger 落库（见 run_ledger 模块 docstring）。
+    # 没有它，24h 后产物被 TTL 清掉就再没人能回答"这行 metrics 是拿什么跑出来的"。
+    provenance = {
+        "data_version": version,
+        "engine": "qlib",  # 执行器容器固定：qlib 0.9.7 + mlflow 3.16.1 + qrun
+        "code_hashes": {
+            f["name"]: fb.cache_key(f["code"], version)
+            for f in list(sota or []) + list(new_factors or [])
+        },
+        "spec": {
+            "profile": profile,
+            "baseline": baseline,
+            "windows": windows or {},
+            "sota": [f["name"] for f in (sota or [])],
+            "new_factors": [f["name"] for f in (new_factors or [])],
+            # 类型化 BacktestSpec（universe/窗口/成本/策略/模型/seed）—— agent 的显式意图
+            "overrides": spec or {},
+        },
+    }
+
+    # 数据新鲜度闸门（治 G7）：宁可拒跑，也不要静默用旧面板给一个"看起来正常"的结果。
+    # 查不出来（异常）时放行 —— 健康查询自身故障不该拦回测。
+    data_health_info: dict = {}
+    if not allow_stale:
+        from factor_miner import data_health as _dh
+
+        stale, stale_days, why = _dh.staleness()
+        data_health_info = {"stale_days": stale_days}
+        if stale:
+            return {
+                "ok": False, "dedup_dropped": False, "sota_broken": [],
+                "metrics": {}, "correlations": {}, "net_values": [], "net_curve": [],
+                "error": f"DATA_STALE: {why}", "error_code": "DATA_STALE", "retryable": False,
+                "hint": "先跑 update_data 刷新面板；确认要跑历史数据可传 allow_stale=true",
+                "data_health": data_health_info,
+                "traceback": "",
+            }
+
+    # spec 先校验：非法键/类型要在**提交前**就被拒，并给出可行动的 code
+    if spec:
+        try:
+            fb.spec_to_ctx(spec)
+        except ValueError as exc:
+            return {
+                "ok": False, "dedup_dropped": False, "sota_broken": [],
+                "metrics": {}, "correlations": {}, "net_values": [], "net_curve": [],
+                "error": str(exc), "error_code": "BAD_SPEC", "retryable": False,
+                "hint": "spec 支持 universe/window/{open_cost,close_cost,min_cost}/"
+                        "{topk,n_drop,seed}/{num_leaves,num_threads}",
+                "traceback": "",
+            }
 
     sota_srcs = [fb.FactorSrc(name=f["name"], code=f["code"]) for f in sota]
 
@@ -371,14 +453,63 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
     errors: dict = {}
     last_tb = ""
     any_ok = False
+    mlruns_run_id: str | None = None
 
     # 远程模式下 conf 的 qlib_init.provider_uri 必须指向**执行器**的挂载路径
     remote_uri = (os.environ.get("FACTOR_EXECUTOR_PROVIDER_URI") or None
                   if os.environ.get("FACTOR_EXECUTOR_URL", "").strip() else None)
+
+    if baseline:
+        # 纯 Alpha20 基线回测（无因子）：给 RD-Agent 的 baseline 实验用 ——
+        # 它的 feedback 层读 exp.based_experiments[-1].result 当 SOTA 对比，
+        # 缺这一步第一轮就会以 KeyError: 'SOTA Result' 崩掉。
+        # **必须沿用与因子轮相同的 profile/windows**，否则基线（csi300/2008-2018）
+        # 与因子轮（如 smoke 的 30 票/2019）不可比，feedback 的"是否优于 SOTA"就没意义。
+        if new_factors:
+            return {"ok": False, "dedup_dropped": False, "sota_broken": [],
+                    "metrics": {}, "correlations": {}, "net_values": [], "net_curve": [],
+                    "error": "BAD_SPEC: baseline=True 不接受 new_factors（基线就是 Alpha20 本身）",
+                    "error_code": "BAD_SPEC", "retryable": False,
+                    "traceback": ""}
+        work_dir = BACKTEST_ROOT / uuid.uuid4().hex
+        conf = (_render_windows_conf(work_dir, profile, windows, remote_uri,
+                                     template=fb.BASELINE_CONF_TEMPLATE, spec=spec)
+                if windows else fb.BASELINE_CONF_TEMPLATE)
+        res = fb.run_backtest(
+            sota_factors=[],
+            new_factor=None,
+            work_dir=work_dir,
+            data_h5=data_h5,
+            conf_template=conf,
+            profile=profile,
+            version=version,
+            execute=_executor_dispatch(work_dir, version),
+            provider_uri=remote_uri,
+            baseline=True,
+            spec=spec,
+        )
+        return {
+            "ok": res.ok,
+            "dedup_dropped": False,
+            "sota_broken": [],
+            "metrics": res.metrics if res.ok else {},
+            "correlations": {},
+            "net_values": res.net_values if res.ok else [],
+            "net_curve": _downsample_curve(getattr(res, "net_curve", None) or [])
+            if res.ok else [],
+            "error": res.error or "",
+            "error_code": "" if res.ok else _classify_error(res.error or "", res.traceback or "")[0],
+            "retryable": None if res.ok else _classify_error(res.error or "", res.traceback or "")[1],
+            "traceback": res.traceback or "",
+            "artifacts_dir": str(work_dir),
+            "mlruns_run_id": res.mlruns_run_id,
+            **provenance,
+        }
+
     for nf in new_factors:
         new_src = fb.FactorSrc(name=nf["name"], code=nf["code"])
         work_dir = BACKTEST_ROOT / uuid.uuid4().hex
-        conf = (_render_windows_conf(work_dir, profile, windows, remote_uri)
+        conf = (_render_windows_conf(work_dir, profile, windows, remote_uri, spec=spec)
                 if windows else fb.DEFAULT_CONF_TEMPLATE)
         res = fb.run_backtest(
             sota_factors=sota_srcs,
@@ -393,6 +524,7 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
             # 远程模式下 conf 的 qlib_init.provider_uri 必须指向**执行器**的挂载路径。
             # 本地模式不传，沿用模板默认值（行为不变）。
             provider_uri=remote_uri,
+            spec=spec,
         )
         _write_back_cache(sota_srcs + [new_src], version, work_dir)
         correlations[new_src.name] = _correlations(new_src, sota_srcs, version, work_dir)
@@ -404,6 +536,7 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
                 metrics, net_values = res.metrics, res.net_values
                 # 带日期的净值曲线与 net_values 同源同口径，取同一个成功因子那一轮
                 net_curve = list(getattr(res, "net_curve", None) or [])
+                mlruns_run_id = getattr(res, "mlruns_run_id", None)
         elif res.dedup_dropped:
             dropped.append(new_src.name)
         else:
@@ -414,6 +547,9 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
     error = ""
     if errors:
         error = "; ".join(f"{n}: {e}" for n, e in errors.items())
+    err_code, retryable = _classify_error(error, last_tb) if (error or all_dropped) else ("", None)
+    if all_dropped and not error:
+        err_code, retryable = "DEDUP_DROPPED", True
     return {
         "ok": any_ok,
         # 全部被去重闸门丢弃 = RD-Agent FactorEmptyError 语义（Go 侧记 decision=false）
@@ -425,7 +561,13 @@ def _run_backtest(sota: list, new_factors: list, profile: str, windows: dict | N
         # 带日期的净值曲线（已抽稀）。net_values 保持原样不动，见 _downsample_curve。
         "net_curve": _downsample_curve(net_curve),
         "error": error,
+        # 错误码化：让 agent 能据此决定 重试 / 换参 / 放弃（治 G4）
+        "error_code": err_code,
+        "retryable": retryable,
         "traceback": last_tb,
+        "artifacts_dir": str(BACKTEST_ROOT),
+        "mlruns_run_id": mlruns_run_id,
+        **provenance,
     }
 
 
@@ -462,19 +604,28 @@ def _executor_dispatch(work_dir: Path, version: str | None):
 
 
 def factor_backtest(sota: list, new_factors: list, profile: str = "full",
-                    windows: dict | None = None) -> str:
+                    windows: dict | None = None, baseline: bool = False,
+                    spec: dict | None = None, allow_stale: bool = False) -> str:
     """qlib 全量回测（§6）。sota/new_factors 元素为 {"name":..., "code":...}。
 
-    返回 JSON: BacktestResult 字段 + correlations（新因子名 → 对每个 SOTA 的 IC 列表）。
-    任何异常都兜底成 ok=False 的 JSON，不抛出（/call-tool 通道约定）。
+    baseline=True → 纯 Alpha20 基线回测（new_factors 必须为空）。RD-Agent 集成需要它：
+    上游 QlibFactorRunner.develop() 会先跑 baseline，feedback 层再读它的 result 当 SOTA 对比。
+
+    spec（类型化 BacktestSpec，治 G1）：universe/window/{open_cost,close_cost,min_cost}/
+    {topk,n_drop,seed}/{num_leaves,num_threads}。优先级：spec > windows > profile。
+
+    返回 JSON: BacktestResult 字段 + correlations + 归因字段
+    （data_version / code_hashes / spec / artifacts_dir / mlruns_run_id）+ 错误码
+    （error_code / retryable）。任何异常都兜底成 ok=False 的 JSON，不抛出。
     """
     try:
-        return _json(_run_backtest(sota or [], new_factors or [], profile, windows))
+        return _json(_run_backtest(sota or [], new_factors or [], profile, windows, baseline, spec, allow_stale))
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
         return _json({
             "ok": False, "dedup_dropped": False, "sota_broken": [],
             "metrics": {}, "correlations": {}, "net_values": [],
             "error": "factor_backtest worker exception",
+            "error_code": "ENGINE_ERROR", "retryable": True,
             "traceback": tb_module.format_exc(),
         })
 

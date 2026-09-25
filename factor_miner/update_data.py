@@ -535,6 +535,64 @@ def atomic_swap(provider_dir: Path, staging: Path, prev: Path):
 
 # ═══════════════ h5 重建 + manifest ═══════════════
 
+def _calendar_tail_day(provider_dir: Path) -> "pd.Timestamp | None":
+    """qlib 日历最后一行 = 可回测的最后交易日。"""
+    cal = provider_dir / "calendars" / "day.txt"
+    try:
+        with cal.open("rb") as fh:
+            fh.seek(max(0, cal.stat().st_size - 4096))
+            lines = fh.read().decode(errors="ignore").strip().splitlines()
+        return pd.Timestamp(lines[-1].strip()) if lines else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _panel_last_day(out_dir: Path) -> "pd.Timestamp | None":
+    """面板最后交易日：manifest 记录与 h5 mtime 取较新者（gen_data 重建不写 manifest）。"""
+    days = []
+    mp = out_dir / "manifest.json"
+    if mp.exists():
+        try:
+            day = json.loads(mp.read_text()).get("last_trading_day")
+            if day:
+                days.append(pd.Timestamp(str(day)[:10]))
+        except Exception:  # noqa: BLE001
+            pass
+    h5 = out_dir / "daily_pv_all.h5"
+    if h5.exists():
+        days.append(pd.Timestamp(h5.stat().st_mtime, unit="s", tz="Asia/Shanghai").tz_localize(None).normalize())
+    return max(days) if days else None
+
+
+def _h5_lag_days(out_dir: Path, provider_dir: Path) -> int:
+    """面板落后日历几个交易日（0 = 不落后）。取不到就返回 0（不误触发重建）。"""
+    panel, cal = _panel_last_day(out_dir), _calendar_tail_day(provider_dir)
+    if panel is None or cal is None or cal <= panel:
+        return 0
+    return int(len(pd.bdate_range(panel + pd.Timedelta(days=1), cal)))
+
+
+def _update_manifest_after_h5(out_dir: Path, provider_dir: Path, h5_sha) -> None:
+    """补重建 h5 后更新 manifest（保留既有字段，原子替换）。"""
+    mp = out_dir / "manifest.json"
+    data: dict = {}
+    if mp.exists():
+        try:
+            data = json.loads(mp.read_text())
+        except Exception:  # noqa: BLE001
+            data = {}
+    cal = _calendar_tail_day(provider_dir)
+    data.update({
+        "last_trading_day": cal.strftime("%Y-%m-%d") if cal is not None else data.get("last_trading_day"),
+        "h5_sha256": h5_sha,
+        "generated_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
+        "h5_rebuilt_without_fetch": True,
+    })
+    tmp = mp.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    tmp.replace(mp)
+
+
 def regen_h5(provider_dir: Path, out_dir: Path) -> tuple:
     """复用 gen_data.gen_full 全量重建 daily_pv_all.h5（临时文件 + os.replace 原子发布）。
     返回 (h5_path, elapsed_sec, sha256)。"""
@@ -700,6 +758,20 @@ def _run_impl(provider_uri: str, out_dir: str, fetcher=None, source: str = "auto
         new_days = new_days[:-1]
     if not new_days and not force:
         log.info("无新交易日（最新 %s），无需更新", d0.strftime("%Y-%m-%d"))
+        # ★ 但 h5 面板可能落后于 .bin 日历：实测 2026-09-25 面板停在 09-15 而日历已到 09-24，
+        #   早退导致"抓数成功但面板不跟"，回测就会静默用旧数据（现有 DATA_STALE 闸门会拦，
+        #   但根因在这里）。所以无新交易日也要检查一次面板漂移并补重建。
+        if not skip_h5:
+            lag_days = _h5_lag_days(out, provider_dir)
+            if lag_days > 0:
+                log.info("面板落后日历 %d 天 → 补重建 h5（不抓数）", lag_days)
+                try:
+                    _, h5_elapsed, h5_sha = regen_h5(provider_dir, out)
+                except Exception as e:  # noqa: BLE001
+                    log.error("h5 补重建失败（可手动跑 gen_data --full）: %s", e)
+                    return EXIT_FAIL
+                _update_manifest_after_h5(out, provider_dir, h5_sha)
+                log.info("daily_pv_all.h5 补重建完成, 耗时 %.0fs", h5_elapsed)
         return EXIT_OK
     log.info("新交易日: %s", new_days)
 

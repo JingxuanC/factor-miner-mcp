@@ -61,6 +61,9 @@ DEFAULT_TIMEOUT = 1800  # qrun 墙壁时钟（spec §6 评审修订）
 DEFAULT_PROVIDER_URI = "~/.qlib/qlib_data/cn_data"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONF_TEMPLATE = PACKAGE_DIR / "conf_combined_factors.yaml"
+# 纯 Alpha20 基线模板（RD-Agent baseline 语义）：组合回测 = 基线 + 新因子，而 RD-Agent
+# 的 feedback 层需要 baseline 本身的指标当 SOTA 对比（缺它第一轮就 KeyError: 'SOTA Result'）。
+BASELINE_CONF_TEMPLATE = PACKAGE_DIR / "conf_baseline.yaml"
 
 # Alpha20 基线特征表达式：照抄 rdagent/utils/qlib.py ALPHA20（MIT）
 ALPHA20 = {
@@ -129,6 +132,9 @@ class BacktestResult:
     # 所以新增字段而不是改掉它。
     net_curve: list[dict] = field(default_factory=list)
     trades: list[dict] = field(default_factory=list)  # 买卖点标记 [{symbol,date,action}]
+    # qrun 产出的 mlflow run id（归因：按 run 取指标，而不是"取最新 recorder"）。
+    # 只有走执行器的路径才有（本地路径留 None）；由 executor 的 result.json 回传。
+    mlruns_run_id: str | None = None
     error: str = ""
     traceback: str = ""
 
@@ -334,9 +340,95 @@ def _daily_ic(a: pd.Series, b: pd.Series) -> float:
     return float(ics.mean()) if len(ics) else 0.0
 
 
+def spec_to_ctx(spec: dict | None) -> dict:
+    """把类型化 **BacktestSpec** 翻译成 conf 模板的 Jinja 上下文（治 G1）。
+
+    agent 之前只能选 `profile: full|smoke`，universe/窗口/成本/策略/seed 全烘焙在模板里
+    —— 于是"想跑 csi500 + 10bp 成本 + topk 30"只能改代码，这正是"要 agent 写引擎"的根源。
+
+    支持：
+        universe: {"kind":"preset","name":"smoke"}      → 复用 PROFILE_OVERRIDES
+                  {"kind":"index","name":"csi500"}      → market: csi500
+                  {"kind":"list","symbols":["SH600000"]}→ market: [ ... ]
+        window:   {"train":[a,b], "valid":[a,b], "test":[a,b]}   （test 的 b 可为 None → null）
+        open_cost/close_cost/min_cost/topk/n_drop/seed/num_leaves/num_threads: 数值
+
+    非法键或类型 → `ValueError("BAD_SPEC: ...")`（调用方据此回 error_code=BAD_SPEC）。
+    """
+    if not spec:
+        return {}
+    if not isinstance(spec, dict):
+        raise ValueError("BAD_SPEC: spec 必须是对象")
+
+    allowed = {"universe", "window", "open_cost", "close_cost", "min_cost",
+               "topk", "n_drop", "seed", "num_leaves", "num_threads", "report"}
+    unknown = set(spec) - allowed
+    if unknown:
+        raise ValueError(
+            f"BAD_SPEC: 未知字段 {sorted(unknown)}；支持 {sorted(allowed)}"
+        )
+    ctx: dict = {}
+
+    uni = spec.get("universe")
+    if uni:
+        if not isinstance(uni, dict):
+            raise ValueError("BAD_SPEC: universe 必须是对象 {kind, name|symbols}")
+        kind = uni.get("kind")
+        if kind == "preset":
+            name = str(uni.get("name") or "")
+            if name not in PROFILE_OVERRIDES:
+                raise ValueError(f"BAD_SPEC: 未知 preset {name!r}；可选 {sorted(PROFILE_OVERRIDES)}")
+            ctx.update(PROFILE_OVERRIDES[name])
+        elif kind == "index":
+            name = str(uni.get("name") or "").strip()
+            if not name:
+                raise ValueError("BAD_SPEC: universe.kind=index 需要 name（如 csi300）")
+            ctx["market"] = name
+        elif kind == "list":
+            symbols = uni.get("symbols") or []
+            if not isinstance(symbols, list) or not symbols:
+                raise ValueError("BAD_SPEC: universe.kind=list 需要非空 symbols")
+            ctx["market"] = "[" + ", ".join(str(s) for s in symbols) + "]"
+        else:
+            raise ValueError("BAD_SPEC: universe.kind 必须是 preset|index|list")
+
+    win = spec.get("window")
+    if win:
+        if not isinstance(win, dict):
+            raise ValueError("BAD_SPEC: window 必须是对象")
+        unknown_w = set(win) - {"train", "valid", "test"}
+        if unknown_w:
+            raise ValueError(f"BAD_SPEC: window 只支持 train/valid/test，收到 {sorted(unknown_w)}")
+        for seg, keys in (("train", ("train_start", "train_end")),
+                          ("valid", ("valid_start", "valid_end")),
+                          ("test", ("test_start", "test_end"))):
+            pair = win.get(seg)
+            if pair is None:
+                continue
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(f"BAD_SPEC: window.{seg} 必须是 [start, end]（end 可为 null）")
+            ctx[keys[0]] = str(pair[0])
+            ctx[keys[1]] = "null" if pair[1] is None else str(pair[1])
+
+    for key in ("open_cost", "close_cost", "min_cost", "topk", "n_drop",
+                "seed", "num_leaves", "num_threads"):
+        if key in spec and spec[key] is not None:
+            value = spec[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"BAD_SPEC: {key} 必须是数值，收到 {type(value).__name__}")
+            ctx[key] = int(value) if key in ("topk", "n_drop", "seed", "num_leaves", "num_threads") else value
+
+    spec.get("report")  # report 由工具层消费（html/json），不进 conf
+    return ctx
+
+
 def _render_conf(template_path: Path, out_path: Path, profile: str,
-                 provider_uri: str | None = None) -> None:
-    """Jinja2 预渲染 conf 模板（不用 qrun env-var 机制，spec §6 评审修订）。"""
+                 provider_uri: str | None = None,
+                 spec: dict | None = None) -> None:
+    """Jinja2 预渲染 conf 模板（不用 qrun env-var 机制，spec §6 评审修订）。
+
+    `spec`（类型化 BacktestSpec）在 profile 覆盖**之后**合并 —— 显式意图优先于档位预设。
+    """
     from jinja2 import Template  # noqa: PLC0415 — 与 qlib 一样保持模块可独立 import
 
     ctx = {
@@ -345,6 +437,7 @@ def _render_conf(template_path: Path, out_path: Path, profile: str,
         "feature_names": str(list(ALPHA20.keys())),
     }
     ctx.update(PROFILE_OVERRIDES[profile])
+    ctx.update(spec_to_ctx(spec))
     # provider_uri 可注入：默认沿用模板自带值（本地行为不变），拆出执行器后由
     # --provider-uri 指向执行器容器里的挂载路径。**必须两边同源**，否则回测会读
     # 到另一份数据而静默偏掉 —— 执行器侧另有面板版本校验兜底。
@@ -472,9 +565,9 @@ def read_exp_res(work_dir: Path, provider_uri: str = DEFAULT_PROVIDER_URI) -> tu
 
 def run_backtest(
     sota_factors: list[FactorSrc],
-    new_factor: FactorSrc,
-    work_dir: Path | str,
-    data_h5: Path | str,
+    new_factor: FactorSrc | None = None,
+    work_dir: Path | str = "",
+    data_h5: Path | str = "",
     conf_template: Path | str = DEFAULT_CONF_TEMPLATE,
     exec_cache: Callable[[str], Optional[Path]] = lambda key: None,
     timeout: int = DEFAULT_TIMEOUT,
@@ -485,6 +578,8 @@ def run_backtest(
     execute: Callable[[Path, Path, int, str | None], dict] | None = None,
     provider_uri: str | None = None,
     window_days: int | None = None,
+    baseline: bool = False,
+    spec: dict | None = None,
 ) -> BacktestResult:
     """跑一轮 qlib 回测。失败语义见模块 docstring。
 
@@ -510,8 +605,26 @@ def run_backtest(
     # 沙箱输入窗口：调用方可覆盖，默认取 WINDOW_DAYS（400 交易日）
     window_days = WINDOW_DAYS if window_days is None else window_days
 
-    # ── Step 1: 进程池重执行（逐因子 exec_cache 命中则跳过）──
     version = version or data_version(data_h5)
+
+    if baseline:
+        # 纯 Alpha20 基线：没有因子要算（跳过 Step 1–3 的执行/去重/拼接），
+        # 直接渲染 conf_baseline.yaml 并走**同一条**执行+解析路径（_execute_and_parse）。
+        # 用途：RD-Agent 的 baseline 实验 —— 它的 feedback 层读
+        # exp.based_experiments[-1].result 当 SOTA 对比，缺了第一轮就崩。
+        return _execute_and_parse(
+            work_dir=work_dir,
+            conf_template=Path(conf_template),
+            profile=profile,
+            provider_uri=provider_uri,
+            execute=execute,
+            timeout=timeout,
+            version=version,
+            sota_broken=[],
+            spec=spec,
+        )
+
+    # ── Step 1: 进程池重执行（逐因子 exec_cache 命中则跳过）──
     all_factors = [("sota", f) for f in sota_factors] + [("new", new_factor)]
     dfs: dict[str, pd.DataFrame] = {}
     misses: list[tuple[str, FactorSrc]] = []
@@ -577,14 +690,45 @@ def run_backtest(
     combined = combined.loc[:, ~combined.columns.duplicated(keep="last")]
     combined.to_hdf(work_dir / "combined_factors_df.h5", key="data")
 
-    # ── Step 4: 渲染 conf → 执行 → 解析 ──
+    # ── Step 4: 渲染 conf → 执行 → 解析（与 baseline 共用，见 _execute_and_parse）──
     #
     # 「执行」这一步可注入：默认在本地起 qrun，也可以交给远程执行器（见
     # factor_executor/）。拆出去的理由是资源隔离，不是逻辑差异 —— 因此两边必须
     # 产出同一套 (metrics, net_values, trades)，否则同一个因子在本地与远程会给出
     # 不同指标，而这种分叉几乎不可能被发现。
+    return _execute_and_parse(
+        work_dir=work_dir,
+        conf_template=Path(conf_template),
+        profile=profile,
+        provider_uri=provider_uri,
+        execute=execute,
+        timeout=timeout,
+        version=version,
+        sota_broken=sota_broken,
+        spec=spec,
+    )
+
+
+def _execute_and_parse(
+    *,
+    work_dir: Path,
+    conf_template: Path,
+    profile: str,
+    provider_uri: str | None,
+    execute: Callable[[Path, Path, int, str | None], dict] | None,
+    timeout: int,
+    version: str,
+    sota_broken: list[str],
+    spec: dict | None = None,
+) -> BacktestResult:
+    """渲染 conf → 执行（本地或远程执行器）→ 解析成 BacktestResult。
+
+    抽成独立函数的原因：**baseline（纯 Alpha20）与组合回测（Alpha20+因子）只有前处理
+    不同，第 4 步必须逐字一致**。两条路径一旦分叉，同一份 conf 语义会在两处漂移，
+    而这种漂移几乎不可能被发现（与「本地 vs 远程执行必须产出同一套指标」是同一个理由）。
+    """
     conf_path = work_dir / "conf.yaml"
-    _render_conf(Path(conf_template), conf_path, profile, provider_uri)
+    _render_conf(conf_template, conf_path, profile, provider_uri, spec=spec)
     if execute is None:
         outcome = execute_local(work_dir, timeout)
     else:
@@ -604,6 +748,8 @@ def run_backtest(
     return BacktestResult(
         ok=True, sota_broken=sota_broken, metrics=metrics, net_values=net_values,
         net_curve=net_curve, trades=trades,
+        # 执行器回传的 mlflow run id（本地路径没有 → None）
+        mlruns_run_id=outcome.get("mlruns_run_id"),
     )
 
 

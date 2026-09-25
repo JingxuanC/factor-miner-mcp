@@ -238,7 +238,7 @@ def _run_qrun(job_dir: Path) -> dict[str, Any]:
         }
 
     try:
-        metrics, net_values, trades, net_curve = read_exp_res(job_dir, provider_uri())
+        metrics, net_values, trades, net_curve, mlruns_run_id = read_exp_res(job_dir, provider_uri())
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
@@ -253,6 +253,8 @@ def _run_qrun(job_dir: Path) -> dict[str, Any]:
         "trades": trades,
         # 带日期的净值曲线（qlib 官方 value 列）。追加字段，既有消费者不受影响。
         "net_curve": net_curve,
+        # qrun 产出的 mlflow run id：归因关键（run_ledger 落库；按 run 取指标用）
+        "mlruns_run_id": mlruns_run_id,
         "elapsed_sec": elapsed,
     }
 

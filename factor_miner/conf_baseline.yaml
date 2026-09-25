@@ -1,14 +1,17 @@
-# conf_combined_factors.yaml — FactorMiner qlib 回测配置模板（DESIGN-FACTOR-MINER.md §6）
+# conf_baseline.yaml — 纯 Alpha20 基线回测模板（RD-Agent baseline 语义）
 #
-# 移植自 microsoft/RD-Agent scenarios/qlib/experiment/factor_template/conf_combined_factors.yaml（MIT）。
-# 差异（评审修订，见设计文档 §6）：
-#   - 补 infer_processors: RobustZScoreNorm+Fillna（取自上游 conf_combined_factors_sota_model.yaml）
-#   - market/num_threads/num_leaves 增加 Jinja 占位，支持 --profile smoke
-#   - Jinja 占位沿用上游 var|default(...) 风格，但由 factor_backtest.py 在
-#     Python 侧预渲染——不依赖 qrun 的 env-var 机制。
+# 移植自 microsoft/RD-Agent scenarios/qlib/experiment/factor_template/conf_baseline.yaml（MIT）。
+# 用途：给 RD-Agent 集成补上「baseline 实验」这一步 —— 上游 QlibFactorRunner.develop() 开头
+#       会先跑 baseline，feedback 层再读 exp.based_experiments[-1].result 当 SOTA 对比。
+#       没有它，第一轮 feedback 会以 `KeyError: 'SOTA Result'` 崩掉（报错指不到病因）。
+#
+# 与 conf_combined_factors.yaml 的唯一差异：
+#   - **不含 StaticDataLoader**（不读 combined_factors_df.h5）—— 基线就是 Alpha20 特征本身；
+#   - model/dataset/record 三段与组合口径保持一致，保证 SOTA 与 baseline 可比。
+# market/num_threads/num_leaves 仍是 Jinja 占位，由 factor_backtest._render_conf 预渲染，
+# 因此 --profile smoke 对 baseline 同样生效。
 qlib_init:
-    # 由 factor_backtest._render_conf 的 jinja 上下文注入：本地默认 ~/.qlib/...
-    # 拆出执行器之后，python 侧的 --provider-uri 会把它指到执行器自己的挂载路径。
+    # 由 factor_backtest._render_conf 的 jinja 上下文注入；远程执行时指向执行器挂载路径
     provider_uri: "{{ provider_uri | default('~/.qlib/qlib_data/cn_data', true) }}"
     region: cn
 
@@ -32,13 +35,6 @@ data_handler_config: &data_handler_config
                         feature:
                             - {{ feature_expressions }}
                             - {{ feature_names }}
-                - class: qlib.data.dataset.loader.StaticDataLoader
-                  kwargs:
-                    # dict 分支才会走 load_dataset；qlib 0.9.6 只认
-                    # .h5/.pkl/.csv（parquet 不支持），故用 h5。
-                    # "feature" 键对应拼接后的 ("feature", col) 二级列。
-                    config:
-                        feature: "combined_factors_df.h5"
 
     infer_processors:
         - class: RobustZScoreNorm
@@ -89,8 +85,8 @@ task:
             lambda_l1: 205.6999
             lambda_l2: 580.9768
             max_depth: 8
-            num_leaves: {{ num_leaves | default(210, true) }}
-            num_threads: {{ num_threads | default(20, true) }}
+            num_leaves: {{ num_leaves | default("210", true) }}
+            num_threads: {{ num_threads | default("20", true) }}
     dataset:
         class: DatasetH
         module_path: qlib.data.dataset

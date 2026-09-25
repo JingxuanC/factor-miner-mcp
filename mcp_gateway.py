@@ -515,6 +515,28 @@ class JobQueue:
                         self._jobs_total["done" if ok else "error"] += 1
                 METRICS.inc_call(tool, "ok" if ok else "error")
                 METRICS.observe_latency(tool, time.time() - created_at)
+                # ── run 台账（best-effort）──────────────────────────────────
+                # 产物目录有 TTL 24h（factor_worker.CLEANUP_TTL_SEC），
+                # 但「指标 + 归因」不能随之消失：run_id/tool/tenant/status/
+                # 数据版本/mlruns/产物目录/metrics 独立落库（见 run_ledger 模块 docstring）。
+                # 台账写失败绝不影响作业终态 —— 所以整段吞异常。
+                try:
+                    from factor_miner import run_ledger
+
+                    run_ledger.record(
+                        run_id=job_id,
+                        tool=tool,
+                        tenant=(self._jobs.get(job_id) or {}).get("key") or "",
+                        status="done" if ok else "error",
+                        ok=ok,
+                        result_text=result_text,
+                        error_text=error_text,
+                        elapsed_sec=round(time.time() - created_at, 1),
+                        created_at=created_at,
+                        finished_at=time.time(),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("run ledger hook failed (%s): %s", job_id, e)
             finally:
                 self._q.task_done()
 
