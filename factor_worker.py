@@ -462,14 +462,26 @@ def _executor_dispatch(work_dir: Path, version: str | None):
 
 
 def factor_backtest(sota: list, new_factors: list, profile: str = "full",
-                    windows: dict | None = None) -> str:
+                    windows: dict | None = None, html_report: bool = False) -> str:
     """qlib 全量回测（§6）。sota/new_factors 元素为 {"name":..., "code":...}。
 
     返回 JSON: BacktestResult 字段 + correlations（新因子名 → 对每个 SOTA 的 IC 列表）。
+    html_report=true 时额外返回 html_report 字段：自包含单文件 HTML（内联 SVG，
+    无外部依赖，report.py 渲染），供客户端保存/归档/贴 wiki。
     任何异常都兜底成 ok=False 的 JSON，不抛出（/call-tool 通道约定）。
     """
+    meta = {"sota": sota or [], "new_factors": new_factors or [], "profile": profile}
     try:
-        return _json(_run_backtest(sota or [], new_factors or [], profile, windows))
+        result = _run_backtest(sota or [], new_factors or [], profile, windows)
+        try:
+            data_h5 = DATA_DIR / "daily_pv_all.h5"
+            meta["data_version"] = fb.data_version(data_h5) if data_h5.exists() else ""
+        except Exception:  # noqa: BLE001 — meta 缺数据版本不阻塞报告
+            meta["data_version"] = ""
+        if html_report:
+            import report  # noqa: PLC0415 — 惰性导入，未用时零开销
+            result["html_report"] = report.render_backtest_report(result, meta)
+        return _json(result)
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
         return _json({
             "ok": False, "dedup_dropped": False, "sota_broken": [],
@@ -698,7 +710,7 @@ def _oos_backtest(code: str, name: str, test_start: str) -> dict:
                          {"test_start": test_start})
 
 
-def factor_oos_check(code: str, name: str) -> str:
+def factor_oos_check(code: str, name: str, html_report: bool = False) -> str:
     """生产准入纯样本外检验（§6 OOS 段 / §9 人工卡点）：同一因子分别跑
     挖掘窗口（test 2017→今）与 OOS 窗口（test 2021-01→今）两次 qlib 回测，
     报告 IC/年化/回撤对比与相对衰减 decay = 1 - oos.ic/mining.ic
@@ -706,19 +718,33 @@ def factor_oos_check(code: str, name: str) -> str:
 
     返回 JSON: {oos: {ic, annualized_return, max_drawdown}, mining: {...},
                 decay: float|null, ok, error}。永不抛异常。
+    html_report=true 时额外返回 html_report 字段：双窗口净值对比的自包含 HTML
+    （report.render_oos_report），decay 的分级结论写在横幅里。
     """
+    meta = {"name": name, "mining_test_start": MINING_TEST_START,
+            "oos_test_start": OOS_TEST_START}
+
+    def _with_report(payload: dict) -> str:
+        if html_report:
+            try:
+                import report  # noqa: PLC0415 — 惰性导入
+                payload["html_report"] = report.render_oos_report(payload, meta)
+            except Exception:  # noqa: BLE001 — 报告失败不弄丢准入结论
+                payload["html_report"] = ""
+        return _json(payload)
+
     try:
         mining = _oos_backtest(code, name, MINING_TEST_START)
         if not mining.get("ok"):
             # 透传 traceback：因子失败的真实原因（如沙箱内存不足）之前被吞掉，
             # 只剩一句 "new factor 'x' failed"，完全无法自查（2026-09-15 实测）。
-            return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
+            return _with_report({"oos": {}, "mining": {}, "decay": None, "ok": False,
                           "mining_net_curve": [], "oos_net_curve": [],
                           "error": f"mining-window backtest failed: {mining.get('error', '')}",
                           "traceback": mining.get("traceback", "")})
         oos = _oos_backtest(code, name, OOS_TEST_START)
         if not oos.get("ok"):
-            return _json({"oos": {}, "mining": _pick_metrics(mining["metrics"]),
+            return _with_report({"oos": {}, "mining": _pick_metrics(mining["metrics"]),
                           "decay": None, "ok": False,
                           # 挖掘窗口成功了，曲线照样给出去 —— 有半张图总好过没有
                           "mining_net_curve": _downsample_curve(mining.get("net_curve")),
@@ -730,7 +756,7 @@ def factor_oos_check(code: str, name: str) -> str:
         decay = None
         if m_ic and o_ic is not None:
             decay = 1.0 - float(o_ic) / float(m_ic)
-        return _json({
+        return _with_report({
             "oos": _pick_metrics(oos["metrics"]),
             "mining": _pick_metrics(mining["metrics"]),
             "decay": decay,
@@ -743,7 +769,7 @@ def factor_oos_check(code: str, name: str) -> str:
             "error": "",
         })
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
-        return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
+        return _with_report({"oos": {}, "mining": {}, "decay": None, "ok": False,
                       "mining_net_curve": [], "oos_net_curve": [],
                       "error": "factor_oos_check worker exception",
                       "traceback": tb_module.format_exc()})
