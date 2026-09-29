@@ -407,3 +407,23 @@ def _render_oos(result: dict, meta: dict) -> str:
 {tb_html}
 <div class="foot">factor-miner-mcp · report.py（自包含单文件，无外部依赖）</div>
 </body></html>"""
+
+
+def _safe_slug(slug: str) -> str:
+    """文件名消毒：只留 [A-Za-z0-9._-]，其余换 "_"（防路径注入）。"""
+    return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(slug))[:120]
+
+
+def save_report(html_str: str, reports_dir, slug: str) -> str:
+    """报告落盘 → 返回文件名（不含目录）。reports_dir 不存在时抛 IOError，
+    由调用方决定降级（调用方契约：未配置 FACTOR_REPORT_DIR 就不落盘）。"""
+    import pathlib  # noqa: PLC0415 — 顶层已可用，此处显式无妨
+
+    d = pathlib.Path(reports_dir)
+    if not d.is_dir():
+        raise IOError(f"reports dir not found: {d}")
+    fname = _safe_slug(slug)
+    if not fname.endswith(".html"):
+        fname += ".html"
+    (d / fname).write_text(html_str, encoding="utf-8")
+    return fname

@@ -10,6 +10,9 @@
     POST /mcp           MCP JSON-RPC（initialize / tools/list / tools/call）
     POST /mcp/factor    兼容路径
     GET  /jobs/<id>     异步任务状态/结果（重负载工具走队列）
+    GET  /reports/<f>   回测/OOS HTML 报告静态文件（FACTOR_MINER_REPORT_DIR；
+                        由 factor_backtest/factor_oos_check 传 html_report=true 生成，
+                        响应里带 report_url；鉴权模式下要求 X-License-Key）
     GET  /quota         当前 license key 的额度余量（鉴权模式）
     GET  /queue-stats   队列概况
     GET  /metrics       Prometheus 指标（文本格式，无需鉴权）
@@ -63,6 +66,7 @@ JOB_STATUS_SCHEMA = {
 class FactorHandler(BaseHTTPRequestHandler):
     license_store: LicenseStore | None = None
     job_queue: JobQueue | None = None
+    reports_dir: str = ""  # FACTOR_MINER_REPORT_DIR（server.py main 注入）
 
     def log_message(self, fmt, *args):
         logger.debug("HTTP %s", fmt % args)
@@ -133,8 +137,50 @@ class FactorHandler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "job not found"})
                 return
             self._send(200, job)
+        elif self.path.startswith("/reports/"):
+            self._serve_report()
         else:
             self._send(404, {"error": "not found"})
+
+    def _serve_report(self):
+        """报告静态文件：GET /reports/<file>.html → FACTOR_MINER_REPORT_DIR。
+
+        安全边界：
+          - 未配置报告目录 → 404（不泄露路径存在性）
+          - 文件名规范化后必须仍落在报告目录内（防 ../ 路径穿越）
+          - 鉴权模式下要求有效 license key（报告含策略细节，与 /quota 同级管控）
+        """
+        store = self.license_store
+        if store and store.enabled:
+            ok, info = store.check(self._license_key())
+            if not ok:
+                self._send(401, {"error": info})
+                return
+        if not self.reports_dir:
+            self._send(404, {"error": "reports dir not configured"})
+            return
+        from urllib.parse import unquote  # noqa: PLC0415
+
+        name = unquote(self.path[len("/reports/"):]).lstrip("/")
+        # 只服务 .html；名字里带路径分隔符/空白的直接拒（规范化前就拦）
+        if not name.endswith(".html") or "/" in name or "\\" in name or ".." in name:
+            self._send(404, {"error": "not found"})
+            return
+        import pathlib  # noqa: PLC0415
+
+        root = pathlib.Path(self.reports_dir).resolve()
+        fpath = (root / name).resolve()
+        if fpath.parent != root or not fpath.is_file():
+            self._send(404, {"error": "not found"})
+            return
+        body = fpath.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        # 报告是静态资产，允许代理短缓存；改动靠新文件名（时间戳 slug）
+        self.send_header("Cache-Control", "public, max-age=300")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         try:
@@ -274,6 +320,7 @@ def main():
     FactorHandler.license_store = LicenseStore(args.license_file, domain="factor")
     FactorHandler.job_queue = JobQueue(HANDLERS, workers=args.workers, maxsize=args.queue_size,
                                        handler_timeout_sec=args.job_timeout)
+    FactorHandler.reports_dir = os.environ.get("FACTOR_MINER_REPORT_DIR", "")
 
     # 磁盘清理：启动时跑一次，之后每小时（job/回测目录 TTL + exec_cache LRU）
     try:

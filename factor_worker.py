@@ -46,6 +46,13 @@ EXEC_CACHE_DIR = DATA_DIR / "exec_cache"
 # ── 磁盘清理（原实现 JOBS_ROOT/BACKTEST_ROOT/EXEC_CACHE 永不清理 → /tmp 积压）──
 CLEANUP_TTL_SEC = int(os.environ.get("FACTOR_MINER_CLEANUP_TTL_SEC", 24 * 3600))
 CLEANUP_INTERVAL_SEC = int(os.environ.get("FACTOR_MINER_CLEANUP_INTERVAL_SEC", 3600))
+# 报告归档目录：html_report=true 时除内联 HTML 外再落盘一份，由 server.py
+# 的 GET /reports/<file> 提供访问（"" = 未配置，不落盘、只走内联）。生产部署
+# 挂到云盘/宿主机目录即可跨重启保留；TTL 单独给长一些（报告是给人看的资产）。
+# 注意 Path("") 会解析成 "."（进程 cwd），所以空串必须落成 None 而不是 Path("")。
+_REPORT_DIR_ENV = os.environ.get("FACTOR_MINER_REPORT_DIR", "").strip()
+REPORT_DIR = Path(_REPORT_DIR_ENV) if _REPORT_DIR_ENV else None
+REPORT_TTL_SEC = int(os.environ.get("FACTOR_MINER_REPORT_TTL_SEC", 7 * 24 * 3600))
 EXEC_CACHE_MAX_ENTRIES = int(os.environ.get("FACTOR_MINER_EXEC_CACHE_MAX", 500))
 EXEC_CACHE_MAX_BYTES = int(os.environ.get("FACTOR_MINER_EXEC_CACHE_MAX_BYTES", 20 * 1024 ** 3))
 # 本项目在 /tmp 与数据目录里的中间产物前缀（中断残留；TTL 保护进行中的任务）
@@ -108,6 +115,24 @@ def _get_redis():
 
 def _json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _attach_report(payload: dict, html: str, slug: str) -> dict:
+    """html_report 字段装配：内联 HTML 恒给；配置了 FACTOR_MINER_REPORT_DIR 时
+    再落盘一份并附 report_file / report_url（server.py 的 /reports/ 路由访问）。
+
+    落盘失败不弄丢报告本身——内联 HTML 还在，只是少了 URL（降级记 warning）。
+    """
+    payload["html_report"] = html
+    if html and REPORT_DIR is not None and REPORT_DIR.is_dir():
+        try:
+            import report  # noqa: PLC0415 — 惰性导入
+            fname = report.save_report(html, REPORT_DIR, slug)
+            payload["report_file"] = fname
+            payload["report_url"] = f"/reports/{fname}"
+        except Exception as e:  # noqa: BLE001 — 落盘是锦上添花
+            logger.warning("report save failed: %s", e)
+    return payload
 
 
 # ═══════════════ 磁盘清理（TTL + exec_cache LRU） ═══════════════
@@ -200,6 +225,8 @@ def cleanup_disk(now: float = None) -> dict:
         "h5_tmp": cleanup_stale_dirs(DATA_DIR, now=now, prefixes=_DATA_STALE_PREFIXES),
         "staging": _cleanup_stale_staging(now=now),
     }
+    if REPORT_DIR and REPORT_DIR.is_dir():
+        out["reports"] = cleanup_stale_dirs(REPORT_DIR, ttl_sec=REPORT_TTL_SEC, now=now)
     total = sum(len(v) for v in out.values())
     if total:
         logger.info("disk cleanup removed %d entries: %s", total,
@@ -480,7 +507,9 @@ def factor_backtest(sota: list, new_factors: list, profile: str = "full",
             meta["data_version"] = ""
         if html_report:
             import report  # noqa: PLC0415 — 惰性导入，未用时零开销
-            result["html_report"] = report.render_backtest_report(result, meta)
+            html = report.render_backtest_report(result, meta)
+            slug = (new_factors[0]["name"] if new_factors else "backtest")
+            _attach_report(result, html, f"{slug}-{time.strftime('%Y%m%d-%H%M%S')}")
         return _json(result)
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
         return _json({
@@ -728,7 +757,9 @@ def factor_oos_check(code: str, name: str, html_report: bool = False) -> str:
         if html_report:
             try:
                 import report  # noqa: PLC0415 — 惰性导入
-                payload["html_report"] = report.render_oos_report(payload, meta)
+                html = report.render_oos_report(payload, meta)
+                _attach_report(payload, html,
+                               f"oos-{name}-{time.strftime('%Y%m%d-%H%M%S')}")
             except Exception:  # noqa: BLE001 — 报告失败不弄丢准入结论
                 payload["html_report"] = ""
         return _json(payload)
