@@ -137,10 +137,59 @@ class FactorHandler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "job not found"})
                 return
             self._send(200, job)
+        # 注意顺序：/reports 与 /reports/（索引页）必须先于 /reports/ 前缀判——
+        # "/reports/" 同时是索引路径和文件路由的前缀，startswith 先命中会把
+        # 索引请求当成空文件名打到 _serve_report 上（404）。
+        elif self.path in ("/reports", "/reports/"):
+            self._serve_report_index()
         elif self.path.startswith("/reports/"):
             self._serve_report()
         else:
             self._send(404, {"error": "not found"})
+
+    def _serve_report_index(self):
+        """报告目录页：GET /reports → 按 mtime 倒序列出全部报告（链接 + 生成时间）。
+
+        与 _serve_report 同一鉴权口径；未配置目录时与单文件路由一样 404。
+        """
+        store = self.license_store
+        if store and store.enabled:
+            ok, info = store.check(self._license_key())
+            if not ok:
+                self._send(401, {"error": info})
+                return
+        if not self.reports_dir:
+            self._send(404, {"error": "reports dir not configured"})
+            return
+        import pathlib  # noqa: PLC0415
+
+        root = pathlib.Path(self.reports_dir)
+        files = sorted((p for p in root.glob("*.html") if p.is_file()),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            import datetime  # noqa: PLC0415
+
+            items = "".join(
+                f'<li><a href="/reports/{p.name}">{p.name}</a>'
+                f'<span class="meta">  {datetime.datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}  '
+                f'{(p.stat().st_size / 1024):.0f} KB</span></li>'
+                for p in files)
+            body = f"<h1>回测报告归档</h1><ul>{items}</ul>"
+        else:
+            body = ("<h1>回测报告归档</h1><p>暂无报告（调用 factor_backtest / "
+                    "factor_oos_check 时传 html_report=true 生成）</p>")
+        page = ("<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<title>报告归档</title><style>body{font-family:-apple-system,'PingFang SC',"
+                "sans-serif;margin:32px auto;max-width:760px;color:#1c2128}"
+                "li{margin:8px 0}.meta{color:#8c959f;font-size:12px}"
+                "a{color:#0969da;text-decoration:none}</style></head><body>"
+                + body + "</body></html>").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
 
     def _serve_report(self):
         """报告静态文件：GET /reports/<file>.html → FACTOR_MINER_REPORT_DIR。

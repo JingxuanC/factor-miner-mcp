@@ -53,6 +53,11 @@ CLEANUP_INTERVAL_SEC = int(os.environ.get("FACTOR_MINER_CLEANUP_INTERVAL_SEC", 3
 _REPORT_DIR_ENV = os.environ.get("FACTOR_MINER_REPORT_DIR", "").strip()
 REPORT_DIR = Path(_REPORT_DIR_ENV) if _REPORT_DIR_ENV else None
 REPORT_TTL_SEC = int(os.environ.get("FACTOR_MINER_REPORT_TTL_SEC", 7 * 24 * 3600))
+# R&D 闭环历史库：factor_feedback 每轮落一条（假设/verdict/关键指标），
+# SQLite 标准库零依赖（用户决策：状态用 SQLite，与 job/额度同类状态同待遇）。
+FEEDBACK_DB = Path(os.environ.get(
+    "FACTOR_MINER_FEEDBACK_DB",
+    os.environ.get("FACTOR_MINER_DATA_DIR", "data/factor_mining") + "/factor_feedback.sqlite3"))
 EXEC_CACHE_MAX_ENTRIES = int(os.environ.get("FACTOR_MINER_EXEC_CACHE_MAX", 500))
 EXEC_CACHE_MAX_BYTES = int(os.environ.get("FACTOR_MINER_EXEC_CACHE_MAX_BYTES", 20 * 1024 ** 3))
 # 本项目在 /tmp 与数据目录里的中间产物前缀（中断残留；TTL 保护进行中的任务）
@@ -850,13 +855,31 @@ def factor_feedback(hypothesis: str = "", result: Any = None,
     喂回 researcher 生成下一轮假设。同一种失败永远得到同一种诊断与下一步建议。
 
     返回 JSON: {verdict: success/fixable/rejected, feedback: Markdown 文本,
-                metrics: 提取出的关键指标, shape: 识别出的结果形状}。
+                metrics: 提取出的关键指标, shape: 识别出的结果形状,
+                round: 本轮序号, trend: 最近 N 轮 IC 趋势}。
     metrics 原样传回 prev 参数即可做跨轮进化追踪（IC 变化趋势）。
+    每轮历史落 SQLite（FACTOR_MINER_FEEDBACK_DB，默认 DATA_DIR 下
+    factor_feedback.sqlite3），sqlite3 标准库零依赖，攒几千轮仍可秒查。
     轻量纯函数，同步执行。永不抛异常。
     """
     try:
         import feedback  # noqa: PLC0415 — 惰性导入，零重依赖
-        return _json(feedback.build_feedback(hypothesis, result, prev))
+        out = feedback.build_feedback(hypothesis, result, prev)
+        try:
+            out.update(feedback.log_round(
+                FEEDBACK_DB, hypothesis, out["verdict"],
+                {**out["metrics"], "shape": out["shape"]}))
+            trend = feedback.history_trend(FEEDBACK_DB)
+            if trend:
+                out["trend"] = trend
+                arrow = "↑" if trend["ic_last"] >= trend["ic_first"] else "↓"
+                out["feedback"] += (f"\n\n**闭环趋势**（近 {trend['window']} 轮，共 "
+                                    f"{trend['n']} 轮有 IC）：{trend['ic_first']:.4f} → "
+                                    f"{trend['ic_last']:.4f} {arrow}，窗口均值 "
+                                    f"{trend['ic_mean']:.4f}")
+        except Exception:  # noqa: BLE001 — 记忆失败不影响反馈本体
+            pass
+        return _json(out)
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
         return _json({"verdict": "fixable", "feedback": "",
                       "metrics": {}, "shape": "unknown", "error": tb_module.format_exc()})

@@ -119,3 +119,54 @@ def test_sota_broken_noted():
     r = feedback.build_feedback("h", {**_bt_result(), "sota_broken": ["s1"]})
     assert "s1" in r["feedback"]
     assert "隔离" in r["feedback"]
+
+
+# ── 负 IC 分支 ──
+
+def test_negative_ic_direction_flipped():
+    r = feedback.build_feedback("h", _bt_result(ic=-0.06))
+    assert r["verdict"] == "fixable"
+    assert "方向反了" in r["feedback"]
+    assert "取负" in r["feedback"]
+    assert "0.0600" in r["feedback"]  # 预期取负后 IC
+
+
+def test_negative_weak_ic_still_weak():
+    # 负但绝对值小 → 仍是弱信号，不误判为方向问题
+    r = feedback.build_feedback("h", _bt_result(ic=-0.01))
+    assert r["verdict"] == "rejected"
+    assert "信号弱" in r["feedback"]
+
+
+def test_negative_ic_priority_over_decay():
+    # 强负 IC + 高衰减：方向分支优先（取负后 decay 会换个算法重新看）
+    r = feedback.build_feedback("h", _oos_result(decay=0.8))
+    r = feedback.build_feedback("h", {**_bt_result(ic=-0.07), "decay_hint": None})
+    assert "方向反了" in r["feedback"]
+
+
+# ── SQLite 闭环记忆 ──
+
+def test_log_round_and_trend(tmp_path=None):
+    import os
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    db = os.path.join(d, "fb.sqlite3")
+    assert feedback.log_round(db, "h1", "rejected", {"ic": 0.01}) == {"round": 1}
+    assert feedback.log_round(db, "h2", "success", {"ic": 0.06, "decay": 0.2}) == {"round": 2}
+    t = feedback.history_trend(db)
+    assert t["n"] == 2 and t["window"] == 2
+    assert t["ic_first"] == 0.01 and t["ic_last"] == 0.06
+    assert abs(t["ic_mean"] - 0.035) < 1e-12
+    # window 限制
+    assert feedback.history_trend(db, n=1)["window"] == 1
+    # 无 IC 的记录不影响趋势
+    feedback.log_round(db, "h3", "fixable", {})
+    assert feedback.history_trend(db)["n"] == 2
+    # 库不存在 → None
+    assert feedback.history_trend(os.path.join(d, "none.sqlite3")) is None
+
+
+def test_log_round_bad_path_no_raise():
+    assert feedback.log_round("/nonexistent-dir/x/y.sqlite3", "h", "v", {"ic": 0.1}) == {"round": None}
