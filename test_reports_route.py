@@ -104,3 +104,43 @@ def test_worker_attach_report(tmp_path, monkeypatch=None):
         assert (reports / "t2-20260929.html").read_text() == "<html>x</html>"
     finally:
         fw.REPORT_DIR = old
+
+
+def test_report_index_lists_files(tmp_path):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    report.save_report("<html>a</html>", reports, "r1")
+    report.save_report("<html>b</html>", reports, "r2")
+    httpd, port = _start(tmp_path, reports)
+    try:
+        status, headers, body = _get(port, "/reports/")
+        text = body.decode()
+        assert status == 200
+        assert "text/html" in headers.get("Content-Type", "")
+        assert "r1.html" in text and "r2.html" in text
+        assert "/reports/r1.html" in text
+        # 不配置目录 → 404
+        httpd2, port2 = _start(tmp_path, None)
+        try:
+            assert _get(port2, "/reports/")[0] == 404
+        finally:
+            httpd2.shutdown()
+    finally:
+        httpd.shutdown()
+
+
+def test_report_index_escapes_filename(tmp_path):
+    import pathlib
+
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    # Unix 文件名允许 <>&"：索引页必须转义（存储型 XSS 防护）
+    pathlib.Path(reports / "x<script>.html").write_text("x")
+    httpd, port = _start(tmp_path, reports)
+    try:
+        _, _, body = _get(port, "/reports/")
+        text = body.decode()
+        assert "<script>" not in text
+        assert "&lt;script&gt;" in text
+    finally:
+        httpd.shutdown()

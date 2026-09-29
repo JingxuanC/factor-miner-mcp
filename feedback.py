@@ -132,6 +132,15 @@ def build_feedback(hypothesis: str, result, prev: dict | None = None) -> dict:
     elif shape == "backtest" and r.get("sota_broken"):
         lines.append(f"**注意**：SOTA 因子 {r['sota_broken']} 本轮重算失败被隔离，"
                      "去重对比可能不完整——修复 SOTA 后再下定论。")
+    elif m["ic"] is not None and m["ic"] <= -IC_STRONG:
+        # 方向反了是性价比最高的失败：信号强、构造对、只差一个负号。
+        # 必须放在衰减/弱信号之前判——负 IC 过 decay 分支会得出荒谬结论
+        # （"挖掘窗 IC -0.06 是假象"），放过它就漏掉了最便宜的修复路径。
+        verdict = "fixable"
+        lines.append(f"**诊断**：因子方向反了。IC {m['ic']:.4f}（绝对值 ≥ 强信号线 "
+                     f"{IC_STRONG}，但为负）——信号真实存在，只差一个负号。")
+        lines.append(f"- 下一步：代码里对因子值取负（`-factor` / `1/factor` 视构造而定），"
+                     f"取负后预期 IC ≈ {-m['ic']:.4f}。先重测再谈其他改进。")
     elif m["decay"] is not None and m["decay"] > DECAY_BAD:
         verdict = "rejected"
         lines.append(f"**诊断**：过拟合挖掘窗口。OOS 相对衰减 {m['decay']:.1%}"
@@ -170,3 +179,76 @@ def build_feedback(hypothesis: str, result, prev: dict | None = None) -> dict:
                 + "\n\n**指标快照**：" + json.dumps(
                     {k: v for k, v in m.items() if v is not None}, ensure_ascii=False))
     return {"verdict": verdict, "feedback": feedback, "metrics": m, "shape": shape}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 闭环记忆：每轮 (假设, verdict, metrics) 落 SQLite，跨轮趋势可读
+#
+# 选 SQLite 而不是 JSONL：服务端已经是状态服务（job/额度/缓存），闭环历史是
+# 同类状态——要按假设查询、要防并发写坏、要能攒几千轮后仍然秒查，JSONL 全会
+# 撞墙。sqlite3 是标准库，零新增依赖，与 server.py 的 stdlib 哲学一致。
+# ═══════════════════════════════════════════════════════════════
+
+import sqlite3 as _sqlite3  # noqa: E402
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS feedback_rounds (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    hypothesis TEXT NOT NULL DEFAULT '',
+    verdict    TEXT NOT NULL DEFAULT '',
+    ic         REAL,
+    annualized REAL,
+    max_drawdown REAL,
+    decay      REAL,
+    shape      TEXT
+);
+"""
+
+
+def _open(db_path) -> "_sqlite3.Connection":
+    conn = _sqlite3.connect(str(db_path), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")   # 并发读写不互堵（清理线程同时在跑）
+    conn.executescript(_SCHEMA)
+    return conn
+
+
+def log_round(db_path, hypothesis: str, verdict: str, metrics: dict) -> dict:
+    """追加一轮记录，返回 {"round": id}。写失败不抛——记忆是锦上添花。"""
+    import time as _time  # noqa: PLC0415
+
+    try:
+        with _open(db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO feedback_rounds(ts, hypothesis, verdict, ic, annualized,"
+                " max_drawdown, decay, shape) VALUES (?,?,?,?,?,?,?,?)",
+                (_time.strftime("%Y-%m-%d %H:%M:%S"), hypothesis or "", verdict,
+                 _f(metrics.get("ic")), _f(metrics.get("annualized")),
+                 _f(metrics.get("max_drawdown")), _f(metrics.get("decay")),
+                 metrics.get("shape") or ""))
+            return {"round": cur.lastrowid}
+    except _sqlite3.Error:
+        return {"round": None}
+
+
+def history_trend(db_path, n: int = 10) -> dict | None:
+    """最近 n 轮的 IC 趋势。库不存在/无有效 IC → None（调用方不输出趋势段）。"""
+    import pathlib  # noqa: PLC0415
+
+    if not pathlib.Path(str(db_path)).exists():
+        return None
+    try:
+        with _open(db_path) as conn:
+            rows = conn.execute(
+                "SELECT ic FROM feedback_rounds WHERE ic IS NOT NULL"
+                " ORDER BY id DESC LIMIT ?", (int(n),)).fetchall()
+            total = conn.execute(
+                "SELECT COUNT(*) FROM feedback_rounds WHERE ic IS NOT NULL"
+            ).fetchone()[0]
+    except _sqlite3.Error:
+        return None
+    ics = [r[0] for r in rows][::-1]  # 按时间升序
+    if not ics:
+        return None
+    return {"n": total, "ic_first": ics[0], "ic_last": ics[-1],
+            "ic_mean": sum(ics) / len(ics), "window": len(ics)}
