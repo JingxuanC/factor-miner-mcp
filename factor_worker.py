@@ -843,6 +843,25 @@ def _ic_series_payload(ics, counts=None) -> list[dict]:
     return out
 
 
+def factor_feedback(hypothesis: str = "", result: Any = None,
+                    prev: dict | None = None) -> str:
+    """rdagent 式 R&D 闭环反馈层：把任意一轮实验结果（factor_evaluate /
+    factor_backtest / factor_oos_check 的返回原样传入）结构化成反馈文本，
+    喂回 researcher 生成下一轮假设。同一种失败永远得到同一种诊断与下一步建议。
+
+    返回 JSON: {verdict: success/fixable/rejected, feedback: Markdown 文本,
+                metrics: 提取出的关键指标, shape: 识别出的结果形状}。
+    metrics 原样传回 prev 参数即可做跨轮进化追踪（IC 变化趋势）。
+    轻量纯函数，同步执行。永不抛异常。
+    """
+    try:
+        import feedback  # noqa: PLC0415 — 惰性导入，零重依赖
+        return _json(feedback.build_feedback(hypothesis, result, prev))
+    except Exception:  # noqa: BLE001 — tool 通道永不抛异常
+        return _json({"verdict": "fixable", "feedback": "",
+                      "metrics": {}, "shape": "unknown", "error": tb_module.format_exc()})
+
+
 def factor_recent_ic(code: str, name: str,
                      lookback_days: int = RECENT_IC_LOOKBACK) -> str:
     """周日衰减巡检（§12.3）：近 lookback_days 个交易日的日均截面 Pearson IC
