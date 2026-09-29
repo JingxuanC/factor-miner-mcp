@@ -142,6 +142,22 @@ def factor_recent_ic(code: str, name: str, lookback_days: int = 60) -> str:
     return _impl(code, name, lookback_days)
 
 
+@tool("factor_feedback", "rdagent-style R&D loop feedback: pass the raw result of any experiment "
+      "(factor_evaluate / factor_backtest / factor_oos_check — the whole JSON, as object or string) "
+      "and get a structured verdict + Markdown feedback to feed back into the next hypothesis. "
+      "Same failure always yields the same diagnosis and next-step advice. "
+      "Returns JSON string: {verdict: success/fixable/rejected, feedback, metrics, shape}. "
+      "Pass the returned metrics back as `prev` to track IC evolution across rounds.",
+      {"hypothesis": {"type": "string", "description": "This round's hypothesis (what the factor was supposed to capture)"},
+       "result": {"anyOf": [{"type": "object"}, {"type": "string"}],
+                  "description": "Raw tool result JSON (object or JSON string) from factor_evaluate/factor_backtest/factor_oos_check"},
+       "prev": {"type": "object", "description": "Previous round's extracted metrics (the metrics field of a prior factor_feedback result)", "default": None}},
+      required=["result"])
+def factor_feedback(hypothesis: str = "", result: Any = None, prev: Any = None) -> str:
+    from factor_worker import factor_feedback as _impl
+    return _impl(hypothesis, result, prev)
+
+
 @tool("factor_evaluate", "One-call professional factor evaluation: run factor.py in the sandbox "
       "and return the alphalens-style tearsheet for it — no need to supply factor_values/klines "
       "yourself (this is the difference from factor_tearsheet, and why it closes the code→metrics "

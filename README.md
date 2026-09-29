@@ -5,7 +5,7 @@ A 股量化因子挖掘工具集的独立 MCP（Model Context Protocol）服务�
 factor 域，让任何 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研
 Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上线巡检」流水线。
 
-## 工具清单（17 个）
+## 工具清单（18 个）
 
 **因子挖掘**
 
@@ -17,6 +17,7 @@ Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上
 | `factor_daily_compute` | 每日收盘后计算在线因子，写 Redis `dfactor:{symbol}`（TTL 48h） | 重（异步） |
 | `update_data` | qlib cn_data 每日增量更新（三源熔断 + 原子切换）+ 重建 h5 数据集 | 重（异步） |
 | **`factor_evaluate`** | **一段因子代码 → 专业评估（一条链）**：沙箱跑代码 + 同窗口切片对齐的 alphalens 口径 tearsheet，附**单调性 / IC 半衰期 / IC t 值 / 假设缺失标记**。补上 `factor_execute`（只有契约检查）与 `factor_tearsheet`（要自带 factor_values+klines）之间的断链 | 重（异步） |
+| `factor_feedback` | rdagent 式 R&D 闭环反馈：任意一轮实验结果（evaluate/backtest/oos）→ 结构化 verdict + 反馈文本，喂回下一轮假设；`prev` 传上轮 metrics 做进化追踪 | 轻 |
 | `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 轻 |
 | `compute_factors` | 从 OHLCV K线计算 Alpha158 风格因子（纯 pandas） | 轻 |
 | `predict` | 因子值 → ML 信号预测 | 轻 |
