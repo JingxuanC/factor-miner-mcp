@@ -90,11 +90,14 @@ def factor_execute(code: str, debug: bool = True) -> str:
       {"sota": {"type": "array", "description": "SOTA factors: [{name, code}, ...]"},
        "new_factors": {"type": "array", "description": "New factors to evaluate: [{name, code}, ...]"},
        "profile": {"type": "string", "enum": ["full", "smoke"], "default": "full"},
-       "windows": {"type": "object", "description": "Optional backtest windows: train_start/train_end/valid_start/valid_end/test_start/test_end"}},
+       "windows": {"type": "object", "description": "Optional backtest windows: train_start/train_end/valid_start/valid_end/test_start/test_end"},
+       "html_report": {"type": "boolean", "description": "true=also return html_report field: self-contained single-file HTML "
+                       "report (inline SVG charts, no external deps) ready to save/archive", "default": False}},
       required=["sota", "new_factors"])
-def factor_backtest(sota: list, new_factors: list, profile: str = "full", windows: Optional[dict] = None) -> str:
+def factor_backtest(sota: list, new_factors: list, profile: str = "full", windows: Optional[dict] = None,
+                    html_report: bool = False) -> str:
     from factor_worker import factor_backtest as _impl
-    return _impl(sota, new_factors, profile, windows)
+    return _impl(sota, new_factors, profile, windows, html_report)
 
 
 @tool("factor_oos_check", "Production-admission OOS check: run the factor twice — "
@@ -105,11 +108,13 @@ def factor_backtest(sota: list, new_factors: list, profile: str = "full", window
       "The two net-value curves come from the report qlib already produced for each window "
       "(downsampled to <=400 points); drawing them together is the visual read of `decay`.",
       {"code": {"type": "string", "description": "factor.py source code"},
-       "name": {"type": "string", "description": "factor name"}},
+       "name": {"type": "string", "description": "factor name"},
+       "html_report": {"type": "boolean", "description": "true=also return html_report field: self-contained HTML "
+                       "with both windows' net-value curves overlaid + decay verdict banner", "default": False}},
       required=["code", "name"])
-def factor_oos_check(code: str, name: str) -> str:
+def factor_oos_check(code: str, name: str, html_report: bool = False) -> str:
     from factor_worker import factor_oos_check as _impl
-    return _impl(code, name)
+    return _impl(code, name, html_report)
 
 
 @tool("factor_daily_compute", "Daily post-close compute of live factors: refresh "

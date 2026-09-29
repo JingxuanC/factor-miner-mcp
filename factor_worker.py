@@ -46,6 +46,13 @@ EXEC_CACHE_DIR = DATA_DIR / "exec_cache"
 # ── 磁盘清理（原实现 JOBS_ROOT/BACKTEST_ROOT/EXEC_CACHE 永不清理 → /tmp 积压）──
 CLEANUP_TTL_SEC = int(os.environ.get("FACTOR_MINER_CLEANUP_TTL_SEC", 24 * 3600))
 CLEANUP_INTERVAL_SEC = int(os.environ.get("FACTOR_MINER_CLEANUP_INTERVAL_SEC", 3600))
+# 报告归档目录：html_report=true 时除内联 HTML 外再落盘一份，由 server.py
+# 的 GET /reports/<file> 提供访问（"" = 未配置，不落盘、只走内联）。生产部署
+# 挂到云盘/宿主机目录即可跨重启保留；TTL 单独给长一些（报告是给人看的资产）。
+# 注意 Path("") 会解析成 "."（进程 cwd），所以空串必须落成 None 而不是 Path("")。
+_REPORT_DIR_ENV = os.environ.get("FACTOR_MINER_REPORT_DIR", "").strip()
+REPORT_DIR = Path(_REPORT_DIR_ENV) if _REPORT_DIR_ENV else None
+REPORT_TTL_SEC = int(os.environ.get("FACTOR_MINER_REPORT_TTL_SEC", 7 * 24 * 3600))
 EXEC_CACHE_MAX_ENTRIES = int(os.environ.get("FACTOR_MINER_EXEC_CACHE_MAX", 500))
 EXEC_CACHE_MAX_BYTES = int(os.environ.get("FACTOR_MINER_EXEC_CACHE_MAX_BYTES", 20 * 1024 ** 3))
 # 本项目在 /tmp 与数据目录里的中间产物前缀（中断残留；TTL 保护进行中的任务）
@@ -108,6 +115,24 @@ def _get_redis():
 
 def _json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _attach_report(payload: dict, html: str, slug: str) -> dict:
+    """html_report 字段装配：内联 HTML 恒给；配置了 FACTOR_MINER_REPORT_DIR 时
+    再落盘一份并附 report_file / report_url（server.py 的 /reports/ 路由访问）。
+
+    落盘失败不弄丢报告本身——内联 HTML 还在，只是少了 URL（降级记 warning）。
+    """
+    payload["html_report"] = html
+    if html and REPORT_DIR is not None and REPORT_DIR.is_dir():
+        try:
+            import report  # noqa: PLC0415 — 惰性导入
+            fname = report.save_report(html, REPORT_DIR, slug)
+            payload["report_file"] = fname
+            payload["report_url"] = f"/reports/{fname}"
+        except Exception as e:  # noqa: BLE001 — 落盘是锦上添花
+            logger.warning("report save failed: %s", e)
+    return payload
 
 
 # ═══════════════ 磁盘清理（TTL + exec_cache LRU） ═══════════════
@@ -200,6 +225,8 @@ def cleanup_disk(now: float = None) -> dict:
         "h5_tmp": cleanup_stale_dirs(DATA_DIR, now=now, prefixes=_DATA_STALE_PREFIXES),
         "staging": _cleanup_stale_staging(now=now),
     }
+    if REPORT_DIR and REPORT_DIR.is_dir():
+        out["reports"] = cleanup_stale_dirs(REPORT_DIR, ttl_sec=REPORT_TTL_SEC, now=now)
     total = sum(len(v) for v in out.values())
     if total:
         logger.info("disk cleanup removed %d entries: %s", total,
@@ -462,14 +489,28 @@ def _executor_dispatch(work_dir: Path, version: str | None):
 
 
 def factor_backtest(sota: list, new_factors: list, profile: str = "full",
-                    windows: dict | None = None) -> str:
+                    windows: dict | None = None, html_report: bool = False) -> str:
     """qlib 全量回测（§6）。sota/new_factors 元素为 {"name":..., "code":...}。
 
     返回 JSON: BacktestResult 字段 + correlations（新因子名 → 对每个 SOTA 的 IC 列表）。
+    html_report=true 时额外返回 html_report 字段：自包含单文件 HTML（内联 SVG，
+    无外部依赖，report.py 渲染），供客户端保存/归档/贴 wiki。
     任何异常都兜底成 ok=False 的 JSON，不抛出（/call-tool 通道约定）。
     """
+    meta = {"sota": sota or [], "new_factors": new_factors or [], "profile": profile}
     try:
-        return _json(_run_backtest(sota or [], new_factors or [], profile, windows))
+        result = _run_backtest(sota or [], new_factors or [], profile, windows)
+        try:
+            data_h5 = DATA_DIR / "daily_pv_all.h5"
+            meta["data_version"] = fb.data_version(data_h5) if data_h5.exists() else ""
+        except Exception:  # noqa: BLE001 — meta 缺数据版本不阻塞报告
+            meta["data_version"] = ""
+        if html_report:
+            import report  # noqa: PLC0415 — 惰性导入，未用时零开销
+            html = report.render_backtest_report(result, meta)
+            slug = (new_factors[0]["name"] if new_factors else "backtest")
+            _attach_report(result, html, f"{slug}-{time.strftime('%Y%m%d-%H%M%S')}")
+        return _json(result)
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
         return _json({
             "ok": False, "dedup_dropped": False, "sota_broken": [],
@@ -698,7 +739,7 @@ def _oos_backtest(code: str, name: str, test_start: str) -> dict:
                          {"test_start": test_start})
 
 
-def factor_oos_check(code: str, name: str) -> str:
+def factor_oos_check(code: str, name: str, html_report: bool = False) -> str:
     """生产准入纯样本外检验（§6 OOS 段 / §9 人工卡点）：同一因子分别跑
     挖掘窗口（test 2017→今）与 OOS 窗口（test 2021-01→今）两次 qlib 回测，
     报告 IC/年化/回撤对比与相对衰减 decay = 1 - oos.ic/mining.ic
@@ -706,19 +747,35 @@ def factor_oos_check(code: str, name: str) -> str:
 
     返回 JSON: {oos: {ic, annualized_return, max_drawdown}, mining: {...},
                 decay: float|null, ok, error}。永不抛异常。
+    html_report=true 时额外返回 html_report 字段：双窗口净值对比的自包含 HTML
+    （report.render_oos_report），decay 的分级结论写在横幅里。
     """
+    meta = {"name": name, "mining_test_start": MINING_TEST_START,
+            "oos_test_start": OOS_TEST_START}
+
+    def _with_report(payload: dict) -> str:
+        if html_report:
+            try:
+                import report  # noqa: PLC0415 — 惰性导入
+                html = report.render_oos_report(payload, meta)
+                _attach_report(payload, html,
+                               f"oos-{name}-{time.strftime('%Y%m%d-%H%M%S')}")
+            except Exception:  # noqa: BLE001 — 报告失败不弄丢准入结论
+                payload["html_report"] = ""
+        return _json(payload)
+
     try:
         mining = _oos_backtest(code, name, MINING_TEST_START)
         if not mining.get("ok"):
             # 透传 traceback：因子失败的真实原因（如沙箱内存不足）之前被吞掉，
             # 只剩一句 "new factor 'x' failed"，完全无法自查（2026-09-15 实测）。
-            return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
+            return _with_report({"oos": {}, "mining": {}, "decay": None, "ok": False,
                           "mining_net_curve": [], "oos_net_curve": [],
                           "error": f"mining-window backtest failed: {mining.get('error', '')}",
                           "traceback": mining.get("traceback", "")})
         oos = _oos_backtest(code, name, OOS_TEST_START)
         if not oos.get("ok"):
-            return _json({"oos": {}, "mining": _pick_metrics(mining["metrics"]),
+            return _with_report({"oos": {}, "mining": _pick_metrics(mining["metrics"]),
                           "decay": None, "ok": False,
                           # 挖掘窗口成功了，曲线照样给出去 —— 有半张图总好过没有
                           "mining_net_curve": _downsample_curve(mining.get("net_curve")),
@@ -730,7 +787,7 @@ def factor_oos_check(code: str, name: str) -> str:
         decay = None
         if m_ic and o_ic is not None:
             decay = 1.0 - float(o_ic) / float(m_ic)
-        return _json({
+        return _with_report({
             "oos": _pick_metrics(oos["metrics"]),
             "mining": _pick_metrics(mining["metrics"]),
             "decay": decay,
@@ -743,7 +800,7 @@ def factor_oos_check(code: str, name: str) -> str:
             "error": "",
         })
     except Exception:  # noqa: BLE001 — tool 通道永不抛异常
-        return _json({"oos": {}, "mining": {}, "decay": None, "ok": False,
+        return _with_report({"oos": {}, "mining": {}, "decay": None, "ok": False,
                       "mining_net_curve": [], "oos_net_curve": [],
                       "error": "factor_oos_check worker exception",
                       "traceback": tb_module.format_exc()})
