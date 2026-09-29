@@ -127,3 +127,20 @@ def test_report_index_lists_files(tmp_path):
             httpd2.shutdown()
     finally:
         httpd.shutdown()
+
+
+def test_report_index_escapes_filename(tmp_path):
+    import pathlib
+
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    # Unix 文件名允许 <>&"：索引页必须转义（存储型 XSS 防护）
+    pathlib.Path(reports / "x<script>.html").write_text("x")
+    httpd, port = _start(tmp_path, reports)
+    try:
+        _, _, body = _get(port, "/reports/")
+        text = body.decode()
+        assert "<script>" not in text
+        assert "&lt;script&gt;" in text
+    finally:
+        httpd.shutdown()

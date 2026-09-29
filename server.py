@@ -168,12 +168,19 @@ class FactorHandler(BaseHTTPRequestHandler):
                        key=lambda p: p.stat().st_mtime, reverse=True)
         if files:
             import datetime  # noqa: PLC0415
+            import html as _html  # noqa: PLC0415 — 文件名转义（见下）
 
-            items = "".join(
-                f'<li><a href="/reports/{p.name}">{p.name}</a>'
-                f'<span class="meta">  {datetime.datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}  '
-                f'{(p.stat().st_size / 1024):.0f} KB</span></li>'
-                for p in files)
+            def _row(p):
+                # 文件名来自 glob，而 Unix 文件名可以含 <>&" —— 报告目录通常只有
+                # save_report 写入（已消毒），但人工/其他进程放进来的文件不消毒，
+                # 索引页又是登录后可看的 HTML：不转义就是一个存储型 XSS 入口。
+                name = _html.escape(p.name, quote=True)
+                mtime = datetime.datetime.fromtimestamp(p.stat().st_mtime)
+                return (f'<li><a href="/reports/{name}">{name}</a>'
+                        f'<span class="meta">  {mtime:%Y-%m-%d %H:%M}  '
+                        f'{(p.stat().st_size / 1024):.0f} KB</span></li>')
+
+            items = "".join(_row(p) for p in files)
             body = f"<h1>回测报告归档</h1><ul>{items}</ul>"
         else:
             body = ("<h1>回测报告归档</h1><p>暂无报告（调用 factor_backtest / "
