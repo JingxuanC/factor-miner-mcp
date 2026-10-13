@@ -5,7 +5,12 @@ A 股量化因子挖掘工具集的独立 MCP（Model Context Protocol）服务�
 factor 域，让任何 MCP 客户端（Claude Desktop、Kimi Code、Cursor、自研
 Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上线巡检」流水线。
 
-## 工具清单（17 个）
+## 工具清单（22 个）
+
+> 数量以 `capabilities` 工具的输出为准 —— 这里写死过 17，漂了四个版本没人发现。
+> `/tools` 返回 21 个（`TOOLS` 19 + `EXTRA_SCHEMAS` 2）；`job_status` 只在
+> `/mcp` 里注册、不走 `/tools`，加起来 22。`test_capabilities_contract.py`
+> 会拿本行与真实数量对比，所以改代码不加这里会红。
 
 **因子挖掘**
 
@@ -17,7 +22,7 @@ Agent）都能直接驱动完整的「因子挖掘 → 评估 → 回测 → 上
 | `factor_daily_compute` | 每日收盘后计算在线因子，写 Redis `dfactor:{symbol}`（TTL 48h） | 重（异步） |
 | `update_data` | qlib cn_data 每日增量更新（三源熔断 + 原子切换）+ 重建 h5 数据集 | 重（异步） |
 | **`factor_evaluate`** | **一段因子代码 → 专业评估（一条链）**：沙箱跑代码 + 同窗口切片对齐的 alphalens 口径 tearsheet，附**单调性 / IC 半衰期 / IC t 值 / 假设缺失标记**。补上 `factor_execute`（只有契约检查）与 `factor_tearsheet`（要自带 factor_values+klines）之间的断链 | 重（异步） |
-| `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 轻 |
+| `factor_recent_ic` | 衰减巡检：近 N 交易日截面 IC（纯 pandas，无需 qlib） | 重（异步） |
 | `compute_factors` | 从 OHLCV K线计算 Alpha158 风格因子（纯 pandas） | 轻 |
 | `predict` | 因子值 → ML 信号预测 | 轻 |
 
@@ -154,7 +159,7 @@ docker compose logs -f      # 跟踪日志
 
 ```bash
 curl http://127.0.0.1:50053/health
-curl http://127.0.0.1:50053/tools   # 应返回 16 个工具
+curl http://127.0.0.1:50053/tools   # 应返回 21 个工具（+ job_status 共 22 个）
 ```
 
 说明与限制：

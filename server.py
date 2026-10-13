@@ -17,6 +17,9 @@
 鉴权与额度（mcp_gateway.py）：
     环境变量 MCP_LICENSE_FILE 指向 license JSON 时强制鉴权
     （请求头 X-License-Key）；未配置 = 开放模式（本地/内网）。
+    **配了就必须可用**：文件缺失 / 为空 / 解析失败 / keys 为空 → 启动直接失败
+    （LicenseConfigError，退出码 2），不会静默降级成开放模式。以前会 —— 那是个
+    安全洞：服务照常启动、/health 报 auth:false，运维以为鉴权已启用。
     重负载工具（factor_execute/factor_backtest/factor_oos_check/
     factor_daily_compute/factor_evaluate）提交即入队返回 job_id，客户端轮询
     /jobs/<id> 拿结果。
@@ -31,9 +34,21 @@ import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from tools import EXTRA_SCHEMAS, HANDLERS, TOOLS  # noqa: F401 — 副作用：注册全部工具
+from tools import (
+    ASYNC_TOOLS,  # noqa: F401 — re-export；定义见 tools.py（唯一真源）
+    EXTRA_SCHEMAS,
+    HANDLERS,
+    TOOLS,  # noqa: F401 — 副作用：注册全部工具
+)
 
-from mcp_gateway import METRICS, JobQueue, LicenseStore, QueueFull, QuotaExceeded
+from mcp_gateway import (
+    METRICS,
+    JobQueue,
+    LicenseConfigError,
+    LicenseStore,
+    QueueFull,
+    QuotaExceeded,
+)
 from mcp_common import coerce_args
 
 logger = logging.getLogger("factor-mcp")
@@ -43,8 +58,9 @@ SERVER_NAME = "factor-miner-mcp"
 VERSION = "1.0.0"
 
 # 重负载工具：提交后入异步队列执行（返回 job_id 轮询），不占 HTTP 连接。
-ASYNC_TOOLS = {"factor_execute", "factor_backtest", "factor_oos_check", "factor_daily_compute",
-               "factor_evaluate", "ml_train_rolling", "update_data"}
+# 定义在 tools.py —— `capabilities` 要把它发布给调用方，两处各留一份就漂移过
+# 一次（工具自报 5 个、实际 7 个，漏了 factor_evaluate / ml_train_rolling）。
+# 这里只 re-export，保持 `server.ASYNC_TOOLS` 这个历史名字可用（有测试引用它）。
 
 # 异步任务查询工具（不走 HANDLERS，在 _handle_mcp 里特殊处理；查状态不扣额度）
 JOB_STATUS_SCHEMA = {
@@ -271,7 +287,12 @@ def main():
                          "0=不超时；单工具可再经 MCP_JOB_TIMEOUT_<TOOL> 覆盖）")
     args = ap.parse_args()
 
-    FactorHandler.license_store = LicenseStore(args.license_file, domain="factor")
+    # 鉴权配置错了就不启动。静默开放过一次，代价是一个公网可调用的服务。
+    try:
+        FactorHandler.license_store = LicenseStore(args.license_file, domain="factor")
+    except LicenseConfigError as e:
+        logger.error("启动中止（鉴权配置无效）: %s", e)
+        return 2
     FactorHandler.job_queue = JobQueue(HANDLERS, workers=args.workers, maxsize=args.queue_size,
                                        handler_timeout_sec=args.job_timeout)
 
@@ -299,4 +320,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    sys.exit(main() or 0)

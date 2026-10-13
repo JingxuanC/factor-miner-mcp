@@ -1,4 +1,7 @@
-"""tools.py — 因子挖掘 MCP 的工具注册表（7 个工具）。
+"""tools.py — 因子挖掘 MCP 的工具注册表。
+
+（原先这里写着"7 个工具"：那是从 Athena py-sidecar 摘出来时的数量，后来涨到
+22 个，而这行注释没人改。工具清单以 `capabilities` 工具的输出为准。）
 
 从 Athena py-sidecar server.py 摘出 factor 域子集，独立成项目后不再
 依赖 66+ 工具的全量注册表。handler 实现在 factor_worker.py /
@@ -42,6 +45,30 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
         HANDLERS[name] = fn
         return fn
     return deco
+
+
+#: 重负载工具：网关（server.py）让它们入异步队列、返回 job_id 轮询，不占 HTTP
+#: 连接。**唯一真源就在这里** —— `capabilities` 会把它发布给调用方，`server.py`
+#: 从本模块 import 它。
+#:
+#: 为什么放在 tools.py 而不是 server.py：这两个消费者以前各存一份，然后漂移了
+#: ——`capabilities` 自报 5 个，实际 7 个，`factor_evaluate` 与 `ml_train_rolling`
+#: 被漏掉。对 MCP 来说"工具描述就是 Agent 的接口契约"，少报两个重任务会让调用方
+#: 排出错误的计划（比如把 ml_train_rolling 当同步调用打）。
+ASYNC_TOOLS: frozenset[str] = frozenset({
+    "factor_execute",
+    "factor_backtest",
+    "factor_oos_check",
+    "factor_daily_compute",
+    "factor_evaluate",
+    "ml_train_rolling",
+    # 2026-10-13 审计实测：它不是"轻"。走 _run_factor_window 整读全量面板
+    # （factor_worker.py 自陈 ~710MiB / ~27s，Fixed 格式无法部分读）再加沙箱
+    # 120s 超时 —— 同步跑最长约 150s 占着一个 HTTP 线程。README:100 自己就写着
+    # 它的开销与 factor_execute「同源」，而那个是异步的。
+    "factor_recent_ic",
+    "update_data",
+})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -463,8 +490,7 @@ def capabilities() -> str:
         },
         "tools": sorted(TOOLS),
         "extra_tools": sorted(EXTRA_SCHEMAS),
-        "async_tools": ["factor_execute", "factor_backtest", "factor_oos_check",
-                        "factor_daily_compute", "update_data"],
+        "async_tools": sorted(ASYNC_TOOLS),
         "profiles": sorted(PROFILE_OVERRIDES),
         "spec_fields": {
             "universe": "preset(smoke) | index(csi300/csi500/…) | list(symbols)",
