@@ -62,8 +62,8 @@ port_analysis_config: &port_analysis_config
         module_path: qlib.contrib.strategy
         kwargs:
             signal: <PRED>
-            topk: 50
-            n_drop: 5
+            topk: {{ topk | default(50, true) }}
+            n_drop: {{ n_drop | default(5, true) }}
     backtest:
         start_time: {{ test_start | default("2017-01-01", true) }}
         end_time: {{ test_end | default("null", true) }}
@@ -72,9 +72,9 @@ port_analysis_config: &port_analysis_config
         exchange_kwargs:
             limit_threshold: 0.095
             deal_price: close
-            open_cost: 0.0005
-            close_cost: 0.0015
-            min_cost: 5
+            open_cost: {{ open_cost | default(0.0005, true) }}
+            close_cost: {{ close_cost | default(0.0015, true) }}
+            min_cost: {{ min_cost | default(5, true) }}
 
 task:
     model:
@@ -82,6 +82,7 @@ task:
         module_path: qlib.contrib.model.gbdt
         kwargs:
             loss: mse
+            seed: {{ seed | default(42, true) }}
             colsample_bytree: 0.8879
             learning_rate: 0.2
             subsample: 0.8789

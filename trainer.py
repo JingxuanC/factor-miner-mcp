@@ -57,6 +57,126 @@ def compute_labels(klines: list) -> list:
     return labels
 
 
+# ── validation metrics ───────────────────────────────────────────────────
+
+def _finite(x) -> float:
+    """NaN/±Inf → 0.0.
+
+    ``round(nan, 4)`` reaches ``json.dumps`` as a bare ``NaN``, which is **not
+    legal JSON** and makes ``json.loads`` / JS ``JSON.parse`` on the caller side
+    throw. A constant prediction column produces exactly that, and it did once
+    before on the miner side (see the ``_sanitize`` note in run_ledger). Every
+    metric leaves this module through here.
+    """
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    return x if math.isfinite(x) else 0.0
+
+
+def _varies(x) -> bool:
+    """True when ``x`` has more than one point and a non-zero spread.
+
+    Checked before every correlation so a constant column returns 0 instead of
+    reaching scipy/numpy — both of which warn (``ConstantInputWarning`` /
+    ``invalid value encountered in divide``) and hand back NaN that we would
+    only sanitize afterwards. Cheaper, and it keeps the log clean on the run
+    where someone trains on a degenerate sample.
+
+    ``ptp`` (max − min), not ``std``: a 50-long constant column measures
+    ``std = 5.55e-17`` because the mean is off by an ulp, so a ``std > 0`` test
+    lets the exact case this guard exists for walk straight through. Peak-to-peak
+    is exactly 0 for identical values. NaN input makes ``ptp`` NaN, and
+    ``NaN > 0`` is False — the right answer, since a correlation over NaN is
+    undefined anyway.
+    """
+    arr = np.asarray(x, dtype=np.float64)
+    return arr.size > 1 and bool(np.ptp(arr) > 0)
+
+
+def _spearman(a, b) -> float:
+    """Spearman rank correlation of two equal-length sequences, ties averaged.
+
+    This replaces ``np.corrcoef(np.argsort(a), np.argsort(b))``, which is **not**
+    a rank correlation. A single ``argsort`` yields the *inverse permutation*,
+    not ranks, and Pearson-correlating two inverse permutations neither
+    preserves order nor equals Spearman — measured on 80-point samples it
+    under-reported a true RankIC of 0.54 as −0.13, and it can flip sign.
+
+    ``rank = argsort(argsort(·))`` is the equivalent numpy-only spelling when
+    there are **no ties** (double argsort gives positions, and positions == ranks
+    only without ties). scipy is preferred because it averages tied ranks the way
+    the textbook definition does; the fallback exists only so a build without
+    scipy degrades to a slightly wrong RankIC instead of no metric at all.
+    """
+    if len(a) < 2 or len(b) < 2 or not _varies(a) or not _varies(b):
+        return 0.0
+    try:
+        from scipy import stats
+        return _finite(stats.spearmanr(a, b).statistic)
+    except Exception:  # noqa: BLE001 - scipy missing is a degraded, not fatal, path
+        ra = np.argsort(np.argsort(np.asarray(a))).astype(np.float64)
+        rb = np.argsort(np.argsort(np.asarray(b))).astype(np.float64)
+        if ra.std() == 0 or rb.std() == 0:
+            return 0.0
+        return _finite(np.corrcoef(ra, rb)[0, 1])
+
+
+def ranking_metrics(pred_val, y_val, top_n: int = 10) -> dict:
+    """The validation-tail numbers ``train()`` / ``train_master()`` report.
+
+    One definition for both training paths — the block used to be copy-pasted
+    verbatim into each, which is how the ``rank_ic`` bug came to exist twice.
+
+    What each number **actually is**, because the names over-promise:
+
+    ``ic``
+        Pooled Pearson over every validation row, i.e. all symbols *and* all
+        days in one correlation. It is **not** the per-day cross-sectional IC
+        quant practice means by "IC", so it mixes cross-sectional skill with
+        time-series moves. Fixing it needs the day label, which is already
+        available — ``extract_features`` returns ``dates`` that ``train()``
+        discards into ``_``, and ``train_master`` iterates ``val_days`` keyed by
+        day. Left as-is here because changing the definition of a metric other
+        code reads is a product decision, not a bug fix.
+    ``rank_ic``
+        Spearman over the same pooled rows — the same definition problem, but
+        the *implementation* was outright wrong and is now fixed (see
+        ``_spearman``).
+    ``sharpe``
+        Top-N mean ÷ top-N std × √252. That is the signal-to-noise of **one**
+        cross-section annualised by a constant — not a Sharpe ratio, which is
+        the mean of a *time series* of returns over its own volatility. Kept
+        numerically identical for output compatibility; renaming or redefining
+        it changes what ``ml_metrics`` consumers compare across runs.
+    """
+    n = min(len(pred_val), len(y_val))
+    if n < 2:
+        return {"ic": 0.0, "rank_ic": 0.0, "sharpe": 0.0, "top10_return": 0.0}
+    pred_val = np.asarray(pred_val)[:n]
+    y_val = np.asarray(y_val)[:n]
+
+    ic = (
+        _finite(np.corrcoef(pred_val, y_val)[0, 1])
+        if _varies(pred_val) and _varies(y_val) else 0.0
+    )
+    rank_ic = _spearman(pred_val, y_val)
+
+    top_idx = np.argsort(pred_val)[-top_n:]
+    top10_ret = _finite(np.mean(y_val[top_idx])) if len(top_idx) > 0 else 0.0
+    sharpe = (
+        _finite((top10_ret / (np.std(y_val[top_idx]) + 1e-8)) * np.sqrt(252))
+        if len(top_idx) > 1 else 0.0
+    )
+    return {
+        "ic": ic,
+        "rank_ic": rank_ic,
+        "sharpe": sharpe,
+        "top10_return": top10_ret,
+    }
+
+
 # ── rolling trainer ──────────────────────────────────────────────────────
 
 class RollingTrainer:
@@ -214,12 +334,11 @@ class RollingTrainer:
         )
 
         # Evaluate
-        pred_val = model.predict(X_val)
-        ic = float(np.corrcoef(pred_val, y_val)[0, 1]) if len(pred_val) > 1 else 0
-        rank_ic = float(np.corrcoef(np.argsort(pred_val), np.argsort(y_val))[0, 1]) if len(pred_val) > 1 else 0
-        top10_idx = np.argsort(pred_val)[-10:]
-        top10_ret = float(np.mean(y_val[top10_idx])) if len(top10_idx) > 0 else 0
-        sharpe = (top10_ret / (np.std(y_val[top10_idx]) + 1e-8)) * np.sqrt(252) if len(top10_idx) > 1 else 0
+        _val_metrics = ranking_metrics(model.predict(X_val), y_val)
+        ic = _val_metrics["ic"]
+        rank_ic = _val_metrics["rank_ic"]
+        sharpe = _val_metrics["sharpe"]
+        top10_ret = _val_metrics["top10_return"]
 
         with open(self.model_path, "wb") as f:
             pickle.dump(model, f)
@@ -534,11 +653,11 @@ class RollingTrainer:
                 labels_v.append(yb)
         pred_val = np.concatenate(preds)
         y_val = np.concatenate(labels_v)
-        ic = float(np.corrcoef(pred_val, y_val)[0, 1]) if len(pred_val) > 1 else 0
-        rank_ic = float(np.corrcoef(np.argsort(pred_val), np.argsort(y_val))[0, 1]) if len(pred_val) > 1 else 0
-        top10_idx = np.argsort(pred_val)[-10:]
-        top10_ret = float(np.mean(y_val[top10_idx])) if len(top10_idx) > 0 else 0
-        sharpe = (top10_ret / (np.std(y_val[top10_idx]) + 1e-8)) * np.sqrt(252) if len(top10_idx) > 1 else 0
+        _val_metrics = ranking_metrics(pred_val, y_val)
+        ic = _val_metrics["ic"]
+        rank_ic = _val_metrics["rank_ic"]
+        sharpe = _val_metrics["sharpe"]
+        top10_ret = _val_metrics["top10_return"]
 
         torch.save({
             "state_dict": model.state_dict(),

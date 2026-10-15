@@ -35,6 +35,10 @@ class QuotaExceeded(Exception):
     """当日额度用尽。message 面向用户，含剩余信息。"""
 
 
+class LicenseConfigError(RuntimeError):
+    """license 被配置了但不可用 —— 启动即失败，绝不降级成开放模式。"""
+
+
 class LicenseStore:
     """license key 清单 + 每日用量计数。
 
@@ -44,6 +48,23 @@ class LicenseStore:
 
     daily_quota：当日全部 tools/call 次数上限；heavy_quota：当日重负载
     任务（回测类）上限。0/缺省 = 不限。usage 落盘到同目录 .usage-<domain>.json。
+
+    **故障方向：配置了就必须生效，否则拒绝启动。**
+    ────────────────────────────────────────────
+    这里曾经是 fail-open：文件缺失/为空/解析失败只 `logger.error` 然后继续，
+    `_keys` 留在 `{}`，`enabled` 返回 False，于是"配了鉴权"变成**完全开放**——
+    服务照常启动，`/health` 还报 `auth: false`，运维以为已经启用。
+    （同一个错误在 hub 侧也犯过一次，见 mcp-suite/AUDIT-2026-09-14.md 的 P0-8。）
+
+    现在的契约：
+
+    * ``MCP_LICENSE_FILE`` **未配置** → 开放模式。这是本地/内网的显式选择，
+      想要鉴权就配上，不想要就别配 —— 没有第三条路。
+    * ``MCP_LICENSE_FILE`` **已配置** → 文件必须存在、是合法 JSON、且
+      ``keys`` 是非空 dict，否则构造时抛 :class:`LicenseConfigError`。
+      崩溃是看得见的；静默开放不是。
+    * **运行期**重载失败（文件被删/写坏）**保留上一份可用的 key**，继续按旧
+      清单执法 —— 宁可拒绝新签发的 key，也不在某一刻突然对所有人开放。
     """
 
     def __init__(self, license_file: str = "", domain: str = "factor",
@@ -60,12 +81,47 @@ class LicenseStore:
         self._mu = threading.Lock()
         self._usage: dict[str, dict[str, dict[str, int]]] = {}  # date → key → counters
         if self._file:
-            self.reload(force=True)
+            self._load_initial()
             self._load_usage()
+
+    def _load_initial(self) -> None:
+        """首次加载：任何问题都抛错，不给"降级成开放"留口子。"""
+        path = self._file
+        assert path is not None  # 仅在 _file 为真时被调用
+        hint = ("  修法：把 license 文件放到位；如果本来就不要鉴权，"
+                "请清空 MCP_LICENSE_FILE（本地/内网开放模式是显式的另一条路）。")
+        if not path.exists():
+            raise LicenseConfigError(
+                "MCP_LICENSE_FILE 指向的 license 文件不存在: %s\n%s" % (path, hint))
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise LicenseConfigError(
+                "license 文件读不了: %s (%s)\n%s" % (path, e, hint)) from e
+        try:
+            data = json.loads(raw)
+        except Exception as e:  # noqa: BLE001 - 空文件/半截 JSON 都属这一类
+            raise LicenseConfigError(
+                "license 文件不是合法 JSON: %s (%s: %s)\n%s"
+                % (path, type(e).__name__, e, hint)) from e
+        keys = data.get("keys") if isinstance(data, dict) else None
+        if not isinstance(keys, dict) or not keys:
+            raise LicenseConfigError(
+                "license 文件里没有可用的 keys（需要 {\"keys\": {\"ak_...\": {...}}}）: %s\n%s"
+                % (path, hint))
+        with self._mu:
+            self._keys = keys
+        self._mtime = path.stat().st_mtime
+        logger.info("license keys loaded: %d keys from %s", len(keys), path)
 
     @property
     def enabled(self) -> bool:
-        """配置了 key 文件且至少有一个 key → 强制鉴权；否则开放模式。"""
+        """配置了 key 文件且至少有一个 key → 强制鉴权；否则开放模式。
+
+        ``_load_initial()`` 保证「配了文件 ⇒ 至少一个 key」，所以这里的第二个
+        条件实际恒真 —— 留着它是为了：即使将来有人在构造之后清空 `_keys`，
+        也只会变成"拒绝所有请求"，不会变成"放行所有请求"。
+        """
         return self._file is not None and len(self._keys) > 0
 
     def reload(self, force: bool = False):
@@ -78,12 +134,20 @@ class LicenseStore:
         try:
             data = json.loads(self._file.read_text())
             keys = data.get("keys", {})
+            if not isinstance(keys, dict) or not keys:
+                # 空清单在构造期就是致命错误；运行期走到这里说明文件被写坏了，
+                # 按"重载失败"处理，而不是把 _keys 清空变成对人开放。
+                raise ValueError("license 文件里没有可用的 keys")
             with self._mu:
                 self._keys = keys
                 self._mtime = mtime
             logger.info("license keys reloaded: %d keys", len(keys))
         except Exception as e:  # noqa: BLE001
-            logger.error("license file reload failed: %s", e)
+            # 保留上一份可用的 key，继续按旧清单执法：重载失败的代价必须是
+            # "新签发的 key 暂时进不来"，而不是"这一刻谁都进得来"。
+            logger.error(
+                "license file reload failed, keeping the last good keys (%d): %s",
+                len(self._keys), e)
 
     def check(self, key: str) -> tuple[bool, str]:
         """鉴权。开放模式一律放行；否则 key 必须在清单里。"""
@@ -515,6 +579,28 @@ class JobQueue:
                         self._jobs_total["done" if ok else "error"] += 1
                 METRICS.inc_call(tool, "ok" if ok else "error")
                 METRICS.observe_latency(tool, time.time() - created_at)
+                # ── run 台账（best-effort）──────────────────────────────────
+                # 产物目录有 TTL 24h（factor_worker.CLEANUP_TTL_SEC），
+                # 但「指标 + 归因」不能随之消失：run_id/tool/tenant/status/
+                # 数据版本/mlruns/产物目录/metrics 独立落库（见 run_ledger 模块 docstring）。
+                # 台账写失败绝不影响作业终态 —— 所以整段吞异常。
+                try:
+                    from factor_miner import run_ledger
+
+                    run_ledger.record(
+                        run_id=job_id,
+                        tool=tool,
+                        tenant=(self._jobs.get(job_id) or {}).get("key") or "",
+                        status="done" if ok else "error",
+                        ok=ok,
+                        result_text=result_text,
+                        error_text=error_text,
+                        elapsed_sec=round(time.time() - created_at, 1),
+                        created_at=created_at,
+                        finished_at=time.time(),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("run ledger hook failed (%s): %s", job_id, e)
             finally:
                 self._q.task_done()
 

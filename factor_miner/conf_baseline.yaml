@@ -1,0 +1,116 @@
+# conf_baseline.yaml — 纯 Alpha20 基线回测模板（RD-Agent baseline 语义）
+#
+# 移植自 microsoft/RD-Agent scenarios/qlib/experiment/factor_template/conf_baseline.yaml（MIT）。
+# 用途：给 RD-Agent 集成补上「baseline 实验」这一步 —— 上游 QlibFactorRunner.develop() 开头
+#       会先跑 baseline，feedback 层再读 exp.based_experiments[-1].result 当 SOTA 对比。
+#       没有它，第一轮 feedback 会以 `KeyError: 'SOTA Result'` 崩掉（报错指不到病因）。
+#
+# 与 conf_combined_factors.yaml 的唯一差异：
+#   - **不含 StaticDataLoader**（不读 combined_factors_df.h5）—— 基线就是 Alpha20 特征本身；
+#   - model/dataset/record 三段与组合口径保持一致，保证 SOTA 与 baseline 可比。
+# market/num_threads/num_leaves 仍是 Jinja 占位，由 factor_backtest._render_conf 预渲染，
+# 因此 --profile smoke 对 baseline 同样生效。
+qlib_init:
+    # 由 factor_backtest._render_conf 的 jinja 上下文注入；远程执行时指向执行器挂载路径
+    provider_uri: "{{ provider_uri | default('~/.qlib/qlib_data/cn_data', true) }}"
+    region: cn
+
+market: &market {{ market | default("csi300", true) }}
+benchmark: &benchmark {{ benchmark | default("SH000300", true) }}
+
+data_handler_config: &data_handler_config
+    start_time: {{ train_start | default("2008-01-01", true) }}
+    end_time: {{ test_end | default("null", true) }}
+    instruments: *market
+    data_loader:
+        class: NestedDataLoader
+        kwargs:
+            dataloader_l:
+                - class: qlib.contrib.data.loader.Alpha158DL
+                  kwargs:
+                    config:
+                        label:
+                            - ["Ref($close, -2)/Ref($close, -1) - 1"]
+                            - ["LABEL0"]
+                        feature:
+                            - {{ feature_expressions }}
+                            - {{ feature_names }}
+
+    infer_processors:
+        - class: RobustZScoreNorm
+          kwargs:
+              fields_group: feature
+              clip_outlier: true
+              fit_start_time: {{ train_start | default("2008-01-01", true) }}
+              fit_end_time: {{ train_end | default("2014-12-31", true) }}
+        - class: Fillna
+          kwargs:
+              fields_group: feature
+    learn_processors:
+        - class: DropnaLabel
+        - class: CSZScoreNorm
+          kwargs:
+              fields_group: label
+
+port_analysis_config: &port_analysis_config
+    strategy:
+        class: TopkDropoutStrategy
+        module_path: qlib.contrib.strategy
+        kwargs:
+            signal: <PRED>
+            topk: {{ topk | default(50, true) }}
+            n_drop: {{ n_drop | default(5, true) }}
+    backtest:
+        start_time: {{ test_start | default("2017-01-01", true) }}
+        end_time: {{ test_end | default("null", true) }}
+        account: 100000000
+        benchmark: *benchmark
+        exchange_kwargs:
+            limit_threshold: 0.095
+            deal_price: close
+            open_cost: {{ open_cost | default(0.0005, true) }}
+            close_cost: {{ close_cost | default(0.0015, true) }}
+            min_cost: {{ min_cost | default(5, true) }}
+
+task:
+    model:
+        class: LGBModel
+        module_path: qlib.contrib.model.gbdt
+        kwargs:
+            loss: mse
+            seed: {{ seed | default(42, true) }}
+            colsample_bytree: 0.8879
+            learning_rate: 0.2
+            subsample: 0.8789
+            lambda_l1: 205.6999
+            lambda_l2: 580.9768
+            max_depth: 8
+            num_leaves: {{ num_leaves | default("210", true) }}
+            num_threads: {{ num_threads | default("20", true) }}
+    dataset:
+        class: DatasetH
+        module_path: qlib.data.dataset
+        kwargs:
+            handler:
+                class: DataHandlerLP
+                module_path: qlib.contrib.data.handler
+                kwargs: *data_handler_config
+            segments:
+                train: [{{ train_start | default("2008-01-01", true) }}, {{ train_end | default("2014-12-31", true) }}]
+                valid: [{{ valid_start | default("2015-01-01", true) }}, {{ valid_end | default("2016-12-31", true) }}]
+                test: [{{ test_start | default("2017-01-01", true) }}, {{ test_end | default("null", true) }}]
+    record:
+        - class: SignalRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            model: <MODEL>
+            dataset: <DATASET>
+        - class: SigAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            ana_long_short: False
+            ann_scaler: 252
+        - class: PortAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs:
+            config: *port_analysis_config

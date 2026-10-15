@@ -1,4 +1,7 @@
-"""tools.py — 因子挖掘 MCP 的工具注册表（7 个工具）。
+"""tools.py — 因子挖掘 MCP 的工具注册表。
+
+（原先这里写着"7 个工具"：那是从 Athena py-sidecar 摘出来时的数量，后来涨到
+22 个，而这行注释没人改。工具清单以 `capabilities` 工具的输出为准。）
 
 从 Athena py-sidecar server.py 摘出 factor 域子集，独立成项目后不再
 依赖 66+ 工具的全量注册表。handler 实现在 factor_worker.py /
@@ -42,6 +45,30 @@ def tool(name: str, description: str, properties: dict, required: Optional[list]
         HANDLERS[name] = fn
         return fn
     return deco
+
+
+#: 重负载工具：网关（server.py）让它们入异步队列、返回 job_id 轮询，不占 HTTP
+#: 连接。**唯一真源就在这里** —— `capabilities` 会把它发布给调用方，`server.py`
+#: 从本模块 import 它。
+#:
+#: 为什么放在 tools.py 而不是 server.py：这两个消费者以前各存一份，然后漂移了
+#: ——`capabilities` 自报 5 个，实际 7 个，`factor_evaluate` 与 `ml_train_rolling`
+#: 被漏掉。对 MCP 来说"工具描述就是 Agent 的接口契约"，少报两个重任务会让调用方
+#: 排出错误的计划（比如把 ml_train_rolling 当同步调用打）。
+ASYNC_TOOLS: frozenset[str] = frozenset({
+    "factor_execute",
+    "factor_backtest",
+    "factor_oos_check",
+    "factor_daily_compute",
+    "factor_evaluate",
+    "ml_train_rolling",
+    # 2026-10-13 审计实测：它不是"轻"。走 _run_factor_window 整读全量面板
+    # （factor_worker.py 自陈 ~710MiB / ~27s，Fixed 格式无法部分读）再加沙箱
+    # 120s 超时 —— 同步跑最长约 150s 占着一个 HTTP 线程。README:100 自己就写着
+    # 它的开销与 factor_execute「同源」，而那个是异步的。
+    "factor_recent_ic",
+    "update_data",
+})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -91,13 +118,34 @@ def factor_execute(code: str, debug: bool = True) -> str:
        "new_factors": {"type": "array", "description": "New factors to evaluate: [{name, code}, ...]"},
        "profile": {"type": "string", "enum": ["full", "smoke"], "default": "full"},
        "windows": {"type": "object", "description": "Optional backtest windows: train_start/train_end/valid_start/valid_end/test_start/test_end"},
+       "baseline": {"type": "boolean", "default": False,
+                    "description": "纯 Alpha20 基线回测（不接任何因子）：RD-Agent 的 baseline 实验用。"
+                                   "miner 侧缺它时 RD-Agent 第一轮 feedback 会 KeyError: 'SOTA Result'。"
+                                   "为 true 时 new_factors 必须为空，且沿用同一个 profile/windows 以保证与因子轮可比"},
+       "spec": {"type": "object",
+                "description": "类型化 BacktestSpec（显式意图，优先级 spec > windows > profile）。"
+                               "universe:{kind:'preset',name:'smoke'}|{kind:'index',name:'csi500'}|"
+                               "{kind:'list',symbols:[...]}；window:{train:[a,b],valid:[a,b],test:[a,b]}；"
+                               "open_cost/close_cost/min_cost/topk/n_drop/seed/num_leaves/num_threads。"
+                               "非法键或类型返回 error_code=BAD_SPEC（不会静默忽略）",
+                "properties": {
+                    "universe": {"type": "object"},
+                    "window": {"type": "object"},
+                    "open_cost": {"type": "number"}, "close_cost": {"type": "number"},
+                    "min_cost": {"type": "number"}, "topk": {"type": "integer"},
+                    "n_drop": {"type": "integer"}, "seed": {"type": "integer"},
+                    "num_leaves": {"type": "integer"}, "num_threads": {"type": "integer"}}},
+       "allow_stale": {"type": "boolean", "default": False,
+                       "description": "允许用过期面板回测（默认拒绝：error_code=DATA_STALE）。"
+                                      "仅用于排查历史数据"},
        "html_report": {"type": "boolean", "description": "true=also return html_report field: self-contained single-file HTML "
                        "report (inline SVG charts, no external deps) ready to save/archive", "default": False}},
       required=["sota", "new_factors"])
 def factor_backtest(sota: list, new_factors: list, profile: str = "full", windows: Optional[dict] = None,
-                    html_report: bool = False) -> str:
+                    baseline: bool = False, spec: Optional[dict] = None,
+                    allow_stale: bool = False, html_report: bool = False) -> str:
     from factor_worker import factor_backtest as _impl
-    return _impl(sota, new_factors, profile, windows, html_report)
+    return _impl(sota, new_factors, profile, windows, baseline, spec, allow_stale, html_report)
 
 
 @tool("factor_oos_check", "Production-admission OOS check: run the factor twice — "
@@ -386,6 +434,123 @@ def update_data(source: str = "auto", limit: int = 0, skip_h5: bool = False, for
         else:
             payload["error"] = f"update_data failed with exit_code={rc}"
     return json.dumps(payload, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# run 台账：历史与归因
+#
+# 审计实测：miner 侧唯一持久化写点是 result.json，而产物目录 TTL 24h ——
+# 跑完第二天连指标都查不到。这两个工具读的是独立落库的 quant_runs（见
+# factor_miner/run_ledger.py），**不受产物 TTL 影响**。
+# ═══════════════════════════════════════════════════════════════
+
+@tool("run_get", "Fetch one past run's persisted record by run_id (= the job_id returned when the "
+      "task was submitted). Returns its provenance: tool, tenant, status, elapsed_sec, spec "
+      "(profile/windows/factor names), data_version (panel sha256), code_hashes, mlruns_run_id, "
+      "artifacts_dir, metrics, net_curve. This is the answer to \"what did that run use and what "
+      "did it produce\" — the artifact directory itself is deleted by a 24h TTL, this record is not.",
+      {"run_id": {"type": "string",
+                  "description": "run_id = the job_id returned when the heavy task was submitted"}},
+      required=["run_id"])
+def run_get(run_id: str) -> str:
+    from factor_miner import run_ledger
+
+    item = run_ledger.get(str(run_id).strip())
+    if item is None:
+        return json.dumps(
+            {"ok": False, "run_id": run_id, "error": "run not found",
+             "hint": "run_id 即提交时返回的 job_id；用 run_list 找最近的 run",
+             "ledger_path": run_ledger.ledger_path()},
+            ensure_ascii=False,
+        )
+    return json.dumps({"ok": True, "run": item}, ensure_ascii=False)
+
+
+@tool("run_list", "List past runs (newest first) from the run ledger — it survives the 24h "
+      "artifact TTL that deletes job directories. Filter by tool / status / tenant. "
+      "net_curve is omitted here for size; use run_get(run_id) to fetch it. "
+      "Returns JSON: {ok, count, ledger_path, runs: [{run_id, tool, status, metrics, spec, "
+      "data_version, elapsed_sec, ...}]}.",
+      {"limit": {"type": "integer", "description": "Max rows to return (default 20, max 200)",
+                 "default": 20},
+       "tool": {"type": "string", "description": "Filter by tool, e.g. factor_backtest"},
+       "status": {"type": "string", "description": "Filter by status: done|error|queued|running"},
+       "tenant": {"type": "string", "description": "Filter by tenant (license key owner)"}},
+      required=[])
+def run_list(limit: int = 20, tool: str = "", status: str = "", tenant: str = "") -> str:
+    from factor_miner import run_ledger
+
+    runs = run_ledger.list_runs(limit=limit, tool=tool, status=status, tenant=tenant)
+    return json.dumps(
+        {"ok": True, "count": len(runs),
+         "ledger_path": run_ledger.ledger_path(),
+         "runs": runs},
+        ensure_ascii=False,
+    )
+
+
+@tool("capabilities", "Capability card for planning: engine/versions, tool list, supported "
+      "BacktestSpec fields + example, async-job list, the implicit contracts you must respect "
+      "(metric keys, baseline comparability, job status values, single-slot queue), and run-ledger "
+      "stats. Call this FIRST instead of guessing conventions.",
+      {}, required=[])
+def capabilities() -> str:
+    from factor_miner import run_ledger
+    from factor_miner.factor_backtest import PROFILE_OVERRIDES
+
+    return json.dumps({
+        "ok": True,
+        "service": "factor-miner-mcp",
+        "engine": {
+            "backtest": "qlib（执行器容器内 qrun；qlib 0.9.7 + mlflow，conf 由本服务预渲染）",
+            "evaluator": "纯 pandas（alphalens 口径 tearsheet；不依赖 qlib）",
+            "ml": "lightgbm / sklearn（滚动训练与推理）",
+            "sandbox": "AST 白名单 + rlimit + 120s；因子代码不触网、不带凭证",
+            "data": "qlib cn_data（.bin，6152 标的）+ daily_pv_{all,debug}.h5 面板 + sha256 数据版本",
+        },
+        "tools": sorted(TOOLS),
+        "extra_tools": sorted(EXTRA_SCHEMAS),
+        "async_tools": sorted(ASYNC_TOOLS),
+        "profiles": sorted(PROFILE_OVERRIDES),
+        "spec_fields": {
+            "universe": "preset(smoke) | index(csi300/csi500/…) | list(symbols)",
+            "window": "train/valid/test 各 [start, end]（end 可为 null）",
+            "cost": "open_cost / close_cost / min_cost",
+            "strategy": "topk / n_drop",
+            "model": "num_leaves / num_threads / seed",
+        },
+        "spec_example": {
+            "universe": {"kind": "index", "name": "csi500"},
+            "window": {"train": ["2010-01-01", "2016-12-31"],
+                       "valid": ["2017-01-01", "2017-12-31"],
+                       "test": ["2018-01-01", None]},
+            "open_cost": 0.001, "close_cost": 0.003, "min_cost": 3,
+            "topk": 30, "n_drop": 2, "seed": 7,
+        },
+        "ledger": run_ledger.stats(),
+        "contracts": [
+            "metrics 必须含 IC / 1day.excess_return_with_cost.annualized_return / "
+            "1day.excess_return_with_cost.max_drawdown —— 这三键是 RD-Agent feedback 层硬编码的",
+            "baseline 与因子轮必须同 profile/spec 才可比（否则 SOTA 对比无意义）",
+            "job_status 的成功终态是 done（不是 ok）；任务提交后拿到的 job_id 就是 run_id",
+            "重任务 per-license 串行单槽：返回 BUSY(-32029) 时**不要**假定未提交，用 run_list 核对",
+            "产物目录 TTL 24h，但 run_get/run_list 读的台账永不失效（含 data_version/code_hashes）",
+            "seed 只固定模型侧（LGBM）；qlib 0.9.7 的 TopkDropoutStrategy 无 seed 参数 → "
+            "组合层指标（ann/MDD）不保证逐位一致，信号层（IC/RankIC/ICIR）可复现",
+            "失败会带 error_code（BAD_SPEC/FACTOR_CODE_FAILED/DEDUP_DROPPED/ENGINE_MEMORY/"
+            "TIMEOUT/DATA_MISSING/ENGINE_ERROR）与 retryable，据此决定重试或换参",
+        ],
+    }, ensure_ascii=False)
+
+
+@tool("data_status", "Data freshness & coverage: panel version / last trading day / days since it "
+      "(stale_days) / qlib calendar tail / staleness threshold. Heavy backtests are REFUSED with "
+      "error_code=DATA_STALE when the panel is stale (unless allow_stale=true), so call this when a "
+      "run fails with DATA_STALE, or before a long run to confirm the data is current.",
+      {}, required=[])
+def data_status() -> str:
+    from factor_miner import data_health
+    return json.dumps(data_health.status(), ensure_ascii=False)
 
 
 # compute_factors / predict 无 @tool schema，由 server 端硬编码补（见 server.py）
